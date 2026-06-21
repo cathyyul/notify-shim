@@ -60,6 +60,23 @@ def load_routes(path: str | None = None):
     )
 
 
+def _env_with_binary_on_path(binary: str) -> dict:
+    """os.environ with the openclaw binary's directory prepended to PATH.
+
+    openclaw is a Node CLI; under a minimal launchd PATH
+    (``/usr/bin:/bin:/usr/sbin:/sbin``) it can't find its ``node`` runtime,
+    which lives alongside it (e.g. ``/opt/homebrew/bin``). Prepending that
+    directory lets the CLI resolve node when shims run from a LaunchAgent.
+    """
+    env = dict(os.environ)
+    bindir = os.path.dirname(os.path.abspath(binary))
+    if bindir:
+        parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
+        if bindir not in parts:
+            env["PATH"] = os.pathsep.join([bindir, *parts])
+    return env
+
+
 def send_one(channel: str, target: str, message: str, *, dry_run: bool,
              openclaw_bin: str | None = None):
     """Send to one channel. Return ``(ok: bool, detail: str)``."""
@@ -69,7 +86,8 @@ def send_one(channel: str, target: str, message: str, *, dry_run: bool,
     if dry_run:
         return True, "dry-run (not sent): " + " ".join(cmd[:-1] + ["<message>"])
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              env=_env_with_binary_on_path(binary))
     except FileNotFoundError:
         return False, f"openclaw binary not found: {binary}"
     detail = (proc.stdout + proc.stderr).strip()
