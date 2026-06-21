@@ -63,9 +63,23 @@ gitignored file (default `~/.openclaw/notify/routes.json`). The repo ships
 Resolution order for the config path: `$NOTIFY_ROUTES` →
 `~/.openclaw/notify/routes.json`.
 
-- **Add/remove a channel** for a route: edit that route's `channels` array.
-- **Add a new group**: add a route, then add a `notify-group-<name>` wrapper
-  (copy an existing one, change `--route`).
+**This file is the single switch for where notifications go.** Every notifier
+routes through the shims, so changing a route's `channels` here changes delivery
+everywhere at once — no script edits.
+
+- **Turn a channel off/on** (non-destructive): set `"enabled": false` on the
+  channel (default is `true`). The target id stays so you can flip it back.
+  ```json
+  { "channel": "telegram", "target": "...", "enabled": false }
+  ```
+  If every channel on a route is disabled, the shim sends nothing and exits 0.
+- **Add a channel** (e.g. WhatsApp when out): add an entry to `channels`. Any
+  channel `openclaw message send --channel` supports works (telegram, line,
+  whatsapp, signal, imessage, …); `target` is that channel's raw id (E.164 for
+  WhatsApp/Signal, chat id for Telegram, userId/groupId for LINE).
+- **Go single-channel** (e.g. LINE-only later): disable or remove the others.
+- **Add a new group**: add a route, then a `notify-group-<name>` wrapper (copy
+  an existing one, change `--route`).
 
 ## Delivery
 

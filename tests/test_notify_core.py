@@ -181,3 +181,57 @@ def test_send_one_bare_binary_name_does_not_inject_cwd(monkeypatch):
     notify_core.send_one("line", "Uabc", "hi", dry_run=False, openclaw_bin="openclaw")
 
     assert run.envs[0]["PATH"] == "/usr/bin:/bin"  # unchanged; no cwd injection
+
+
+# --- per-channel enabled toggle ---
+
+DISABLED_ROUTES = {
+    "mixed": {"channels": [
+        {"channel": "telegram", "target": "111"},
+        {"channel": "line", "target": "Uabc", "enabled": False},
+    ]},
+    "all-off": {"channels": [
+        {"channel": "telegram", "target": "111", "enabled": False},
+        {"channel": "line", "target": "Uabc", "enabled": False},
+    ]},
+    "explicit-on": {"channels": [
+        {"channel": "telegram", "target": "111", "enabled": True},
+    ]},
+}
+
+
+@pytest.fixture
+def toggle_routes(tmp_path):
+    p = tmp_path / "routes.json"
+    p.write_text(json.dumps(DISABLED_ROUTES), encoding="utf-8")
+    return str(p)
+
+
+def test_disabled_channel_is_skipped(monkeypatch, toggle_routes):
+    run = make_run()
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    results = notify_core.notify("mixed", "hi", routes_path=toggle_routes)
+
+    # only the enabled telegram channel was sent
+    assert [(c, t) for c, t, _ok, _d in results] == [("telegram", "111")]
+    assert len(run.calls) == 1
+
+
+def test_all_disabled_route_sends_nothing_exits_zero(monkeypatch, toggle_routes):
+    def boom(*a, **k):  # pragma: no cover
+        raise AssertionError("must not send when all channels disabled")
+    monkeypatch.setattr(notify_core.subprocess, "run", boom)
+
+    rc = notify_core.main(["--route", "all-off", "-m", "hi", "--routes", toggle_routes])
+    assert rc == 0
+
+
+def test_explicit_enabled_true_sends(monkeypatch, toggle_routes):
+    run = make_run()
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+    rc = notify_core.main(["--route", "explicit-on", "-m", "hi", "--routes", toggle_routes])
+    assert rc == 0
+    assert len(run.calls) == 1
