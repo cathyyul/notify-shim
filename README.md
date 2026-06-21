@@ -113,11 +113,11 @@ LaunchAgent-driven scripts that have no other sub-project home live here and fan
 out through the shims. They install to the same `scripts/` paths the
 LaunchAgents already call, so no plist changes are needed.
 
-| Script | Trigger | Route |
+| Script | Trigger (LaunchAgent) | Route(s) |
 |--------|---------|-------|
-| `meal-reminder.sh` | breakfast/lunch/dinner LaunchAgents | `notify-dm` |
-| `slickdeals_notifier.sh` | Slickdeals gift-card monitor | `notify-dm` |
-| `weekly_offers_notifier.sh` | weekly standard-offers review | `notify-dm` |
+| `meal-reminder.sh` | `meal-reminder-{breakfast,lunch,dinner}` | `notify-dm` |
+| `slickdeals_deliver.sh` | `slickdeals-monitor` | `notify-dm` |
+| `weekly_offers_deliver.sh` | `weekly-standard-offers` | `notify-dm` + `notify-group-couple` |
 
 ## Test
 
