@@ -20,6 +20,10 @@ if [[ -z "$OPENCLAW_BIN" ]]; then
     fi
   done
 fi
+if [[ -z "$OPENCLAW_BIN" ]]; then
+  echo "deploy: openclaw binary not found; set OPENCLAW_BIN=/absolute/path/to/openclaw" >&2
+  exit 1
+fi
 
 if [[ ! -d "$DEST" ]]; then
   echo "deploy: destination not found: $DEST" >&2
@@ -42,19 +46,15 @@ for n in "$SRC"/notifiers/*.py; do
   echo "deploy: installed notifiers/${n:t} -> $DEST/${n:t}"
 done
 
-if [[ -d "$LAUNCHAGENTS_DIR" ]]; then
-  mkdir -p "$LOGS_DIR"
-  for p in "$SRC"/launchagents/*.plist; do
-    tmp="$(mktemp)"
-    sed -e "s|__HOME__|$HOME|g" \
-        -e "s|__OPENCLAW_BIN__|$OPENCLAW_BIN|g" "$p" > "$tmp"
-    install -m 0644 "$tmp" "$LAUNCHAGENTS_DIR/${p:t}"
-    rm -f "$tmp"
-    echo "deploy: installed launchagents/${p:t} -> $LAUNCHAGENTS_DIR/${p:t}"
-  done
-else
-  echo "deploy: LaunchAgents dir not found, skipped plist install: $LAUNCHAGENTS_DIR" >&2
-fi
+mkdir -p "$LAUNCHAGENTS_DIR" "$LOGS_DIR"
+for p in "$SRC"/launchagents/*.plist; do
+  tmp="$(mktemp)"
+  sed -e "s|__HOME__|$HOME|g" \
+      -e "s|__OPENCLAW_BIN__|$OPENCLAW_BIN|g" "$p" > "$tmp"
+  install -m 0644 "$tmp" "$LAUNCHAGENTS_DIR/${p:t}"
+  rm -f "$tmp"
+  echo "deploy: installed launchagents/${p:t} -> $LAUNCHAGENTS_DIR/${p:t}"
+done
 
 mkdir -p "$ROUTES_DIR"
 if [[ ! -f "$ROUTES_DIR/routes.json" ]]; then

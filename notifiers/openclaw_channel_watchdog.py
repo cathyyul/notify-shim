@@ -482,6 +482,8 @@ def main() -> int:
         }
         if recovery_result:
             payload["recovery"] = asdict(recovery_result)
+        else:
+            state.pop("recovery", None)
         if unhealthy and incident:
             state["active_incident"] = incident
         else:

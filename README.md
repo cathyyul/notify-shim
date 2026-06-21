@@ -111,8 +111,10 @@ seeds `~/.openclaw/notify/routes.json` from the example if it doesn't exist
 Bundled plist files use `__HOME__` and `__OPENCLAW_BIN__` placeholders in the
 repo. `deploy.sh` replaces them with the current `$HOME` and detected
 `openclaw` binary path while installing to `~/Library/LaunchAgents/`. It also ensures
-`~/.openclaw/workspace/logs/` exists before installing the plist, since launchd
-requires the stdout/stderr directory to already exist.
+`~/Library/LaunchAgents/` and `~/.openclaw/workspace/logs/` exist before
+installing the plist, since launchd requires the stdout/stderr directory to
+already exist. If `openclaw` cannot be found, deploy fails and asks for
+`OPENCLAW_BIN=/absolute/path/to/openclaw` rather than installing a broken agent.
 
 Deploy only copies plist files. Load or reload them explicitly after review:
 

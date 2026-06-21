@@ -335,6 +335,41 @@ def test_restart_mode_does_not_restart_same_incident_twice(monkeypatch, tmp_path
     assert calls == {"restart": 0, "notify": 1}
 
 
+def test_healthy_run_clears_stale_recovery_state(monkeypatch, tmp_path):
+    state_file = tmp_path / "state.json"
+    config_file = tmp_path / "openclaw.json"
+    notify_bin = tmp_path / "notify-dm"
+    state_file.write_text(json.dumps({
+        "recovery": {"status": "gateway_restart_ok"},
+        "active_incident": {"key": "whatsapp"},
+    }))
+    config_file.write_text("{}")
+    notify_bin.write_text("#!/bin/sh\nexit 0\n")
+    notify_bin.chmod(0o755)
+    monkeypatch.setattr(
+        mod,
+        "evaluate_channels",
+        lambda *a, **k: [mod.CheckResult("whatsapp", True, "healthy", "ok")],
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "watchdog",
+            "--channels", "whatsapp",
+            "--state-file", str(state_file),
+            "--config-file", str(config_file),
+            "--notify-bin", str(notify_bin),
+            "--openclaw-bin", "openclaw",
+        ],
+    )
+
+    assert mod.main() == 0
+    saved = json.loads(state_file.read_text())
+    assert "recovery" not in saved
+    assert "active_incident" not in saved
+
+
 def test_restart_gateway_returns_failure_detail(monkeypatch):
     monkeypatch.setattr(
         mod,
