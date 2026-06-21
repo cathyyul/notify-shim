@@ -9,6 +9,21 @@ set -euo pipefail
 SRC="${0:A:h}"
 DEST="${NOTIFY_DEST:-$HOME/.openclaw/workspace/scripts}"
 ROUTES_DIR="${NOTIFY_ROUTES_DIR:-$HOME/.openclaw/notify}"
+LAUNCHAGENTS_DIR="${NOTIFY_LAUNCHAGENTS_DIR:-$HOME/Library/LaunchAgents}"
+LOGS_DIR="$HOME/.openclaw/workspace/logs"
+OPENCLAW_BIN="${OPENCLAW_BIN:-$(command -v openclaw || true)}"
+if [[ -z "$OPENCLAW_BIN" ]]; then
+  for candidate in /opt/homebrew/bin/openclaw /usr/local/bin/openclaw; do
+    if [[ -x "$candidate" ]]; then
+      OPENCLAW_BIN="$candidate"
+      break
+    fi
+  done
+fi
+if [[ -z "$OPENCLAW_BIN" ]]; then
+  echo "deploy: openclaw binary not found; set OPENCLAW_BIN=/absolute/path/to/openclaw" >&2
+  exit 1
+fi
 
 if [[ ! -d "$DEST" ]]; then
   echo "deploy: destination not found: $DEST" >&2
@@ -24,6 +39,21 @@ echo "deploy: installed notify-dm, notify-group-couple, notify_core.py -> $DEST"
 for n in "$SRC"/notifiers/*.sh; do
   install -m 0755 "$n" "$DEST/${n:t}"
   echo "deploy: installed notifiers/${n:t} -> $DEST/${n:t}"
+done
+
+for n in "$SRC"/notifiers/*.py; do
+  install -m 0755 "$n" "$DEST/${n:t}"
+  echo "deploy: installed notifiers/${n:t} -> $DEST/${n:t}"
+done
+
+mkdir -p "$LAUNCHAGENTS_DIR" "$LOGS_DIR"
+for p in "$SRC"/launchagents/*.plist; do
+  tmp="$(mktemp)"
+  sed -e "s|__HOME__|$HOME|g" \
+      -e "s|__OPENCLAW_BIN__|$OPENCLAW_BIN|g" "$p" > "$tmp"
+  install -m 0644 "$tmp" "$LAUNCHAGENTS_DIR/${p:t}"
+  rm -f "$tmp"
+  echo "deploy: installed launchagents/${p:t} -> $LAUNCHAGENTS_DIR/${p:t}"
 done
 
 mkdir -p "$ROUTES_DIR"
