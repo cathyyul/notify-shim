@@ -1,0 +1,11 @@
+#!/bin/zsh
+# notify-dm — send a notification to Yuting's personal DM across all
+# channels configured for the "dm" route (currently Telegram + LINE).
+#
+# Usage:
+#   notify-dm "message text"
+#   echo "message text" | notify-dm
+#   notify-dm --dry-run "preview only"
+set -euo pipefail
+here="${0:A:h}"
+exec /usr/bin/env python3 "$here/notify_core.py" --route dm "$@"

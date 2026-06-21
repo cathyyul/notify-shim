@@ -1,0 +1,8 @@
+# Never commit real routing config (contains personal chat/user/group IDs)
+routes.json
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
