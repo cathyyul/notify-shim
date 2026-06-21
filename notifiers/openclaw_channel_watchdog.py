@@ -102,6 +102,30 @@ def default_openclaw_bin() -> str:
     return "openclaw"
 
 
+def command_env(cmd: list[str]) -> dict[str, str]:
+    env = os.environ.copy()
+    path_parts: list[str] = []
+    if cmd:
+        command_path = Path(cmd[0])
+        if command_path.is_absolute():
+            path_parts.append(str(command_path.parent))
+    path_parts.extend([
+        "/opt/homebrew/bin",
+        "/opt/homebrew/opt/node/bin",
+        "/usr/local/bin",
+    ])
+    path_parts.extend(env.get("PATH", "").split(os.pathsep))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for part in path_parts:
+        if part and part not in seen:
+            seen.add(part)
+            deduped.append(part)
+    env["PATH"] = os.pathsep.join(deduped)
+    return env
+
+
 def http_post(url: str, headers: dict[str, str] | None = None,
               data: bytes = b"", timeout: float = 10.0) -> HttpResult:
     req = urllib.request.Request(url, data=data, headers=headers or {}, method="POST")
@@ -117,7 +141,13 @@ def http_post(url: str, headers: dict[str, str] | None = None,
 
 
 def run_command(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(cmd, timeout=timeout, capture_output=True, text=True)
+    return subprocess.run(
+        cmd,
+        timeout=timeout,
+        capture_output=True,
+        text=True,
+        env=command_env(cmd),
+    )
 
 
 def check_line_official_webhook(config: dict[str, Any], timeout: float) -> CheckResult:

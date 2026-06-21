@@ -145,6 +145,41 @@ def test_whatsapp_probe_healthy(monkeypatch):
     assert result.status == "healthy"
 
 
+def test_run_command_prepends_homebrew_paths_for_launchd(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, "{}", "")
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    mod.run_command(["/opt/homebrew/bin/openclaw", "--version"], timeout=1)
+
+    path_parts = captured["env"]["PATH"].split(":")
+    assert path_parts[:3] == [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/opt/node/bin",
+        "/usr/local/bin",
+    ]
+
+
+def test_run_command_includes_absolute_command_directory(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    mod.run_command(["/custom/bin/openclaw", "--version"], timeout=1)
+
+    assert captured["env"]["PATH"].split(":")[0] == "/custom/bin"
+
+
 def test_whatsapp_probe_unlinked_suggests_relink(monkeypatch):
     payload = {
         "channels": {"whatsapp": {"configured": True}},

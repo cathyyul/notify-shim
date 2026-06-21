@@ -182,7 +182,8 @@ Bundled LaunchAgent:
 - checks LINE + WhatsApp
 - uses `--notify --recovery-mode restart --cooldown-minutes 30`
 - passes an absolute `--openclaw-bin` path during deploy so launchd's minimal
-  PATH cannot hide the CLI
+  PATH cannot hide the CLI; watchdog subprocesses also prepend Homebrew paths
+  so OpenClaw's `env node` launcher can resolve Node under launchd
 - writes logs to
   `~/.openclaw/workspace/logs/openclaw-channel-watchdog.log`
 
