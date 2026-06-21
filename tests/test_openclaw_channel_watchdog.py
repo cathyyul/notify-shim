@@ -80,6 +80,12 @@ def test_line_official_webhook_fails_without_token(monkeypatch):
     assert result.status == "missing_line_token"
 
 
+def test_line_token_handles_null_channels(monkeypatch):
+    monkeypatch.delenv("LINE_CHANNEL_ACCESS_TOKEN", raising=False)
+
+    assert mod.get_line_token({"channels": None}) is None
+
+
 def test_line_official_webhook_sends_json_content_type(monkeypatch):
     calls = []
 
@@ -161,6 +167,20 @@ def test_whatsapp_probe_nonzero_exit_is_unhealthy(monkeypatch):
     assert result.ok is False
     assert result.status == "whatsapp_probe_failed"
     assert "gateway unreachable" in result.detail
+
+
+def test_whatsapp_probe_handles_null_json_sections(monkeypatch):
+    payload = {"channels": None, "channelAccounts": None}
+    monkeypatch.setattr(
+        mod,
+        "run_command",
+        lambda cmd, timeout: _Proc(0, stdout=json.dumps(payload)),
+    )
+
+    result = mod.check_whatsapp(timeout_ms=1000)
+
+    assert result.ok is False
+    assert result.status == "whatsapp_unhealthy"
 
 
 def test_cooldown_elapsed_false_for_recent_timestamp(monkeypatch):

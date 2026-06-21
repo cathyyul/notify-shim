@@ -10,6 +10,7 @@ SRC="${0:A:h}"
 DEST="${NOTIFY_DEST:-$HOME/.openclaw/workspace/scripts}"
 ROUTES_DIR="${NOTIFY_ROUTES_DIR:-$HOME/.openclaw/notify}"
 LAUNCHAGENTS_DIR="${NOTIFY_LAUNCHAGENTS_DIR:-$HOME/Library/LaunchAgents}"
+LOGS_DIR="$HOME/.openclaw/workspace/logs"
 
 if [[ ! -d "$DEST" ]]; then
   echo "deploy: destination not found: $DEST" >&2
@@ -33,6 +34,7 @@ for n in "$SRC"/notifiers/*.py; do
 done
 
 if [[ -d "$LAUNCHAGENTS_DIR" ]]; then
+  mkdir -p "$LOGS_DIR"
   for p in "$SRC"/launchagents/*.plist; do
     tmp="$(mktemp)"
     sed "s|__HOME__|$HOME|g" "$p" > "$tmp"

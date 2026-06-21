@@ -78,7 +78,13 @@ def get_line_token(config: dict[str, Any]) -> str | None:
     env_token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
     if env_token:
         return env_token
-    token = config.get("channels", {}).get("line", {}).get("channelAccessToken")
+    channels = config.get("channels")
+    if not isinstance(channels, dict):
+        return None
+    line_config = channels.get("line")
+    if not isinstance(line_config, dict):
+        return None
+    token = line_config.get("channelAccessToken")
     return token if isinstance(token, str) and token.strip() else None
 
 
@@ -210,8 +216,19 @@ def check_whatsapp(timeout_ms: int) -> CheckResult:
             suggested_next_step="Run openclaw channels status --channel whatsapp --probe manually.",
         )
 
-    account = (payload.get("channelAccounts", {}).get("whatsapp") or [{}])[0]
-    channel = payload.get("channels", {}).get("whatsapp", {})
+    channel_accounts = payload.get("channelAccounts")
+    if not isinstance(channel_accounts, dict):
+        channel_accounts = {}
+    accounts = channel_accounts.get("whatsapp")
+    if not isinstance(accounts, list) or not accounts:
+        accounts = [{}]
+    account = accounts[0] if isinstance(accounts[0], dict) else {}
+    channels = payload.get("channels")
+    if not isinstance(channels, dict):
+        channels = {}
+    channel = channels.get("whatsapp")
+    if not isinstance(channel, dict):
+        channel = {}
     health = account.get("healthState") or channel.get("healthState")
     linked = bool(account.get("linked", channel.get("linked")))
     running = bool(account.get("running", channel.get("running")))
