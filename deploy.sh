@@ -20,6 +20,12 @@ install -m 0755 "$SRC/notify-group-couple"  "$DEST/notify-group-couple"
 install -m 0644 "$SRC/notify_core.py"       "$DEST/notify_core.py"
 echo "deploy: installed notify-dm, notify-group-couple, notify_core.py -> $DEST"
 
+# Workspace notifier scripts (called by LaunchAgents at their existing paths).
+for n in "$SRC"/notifiers/*.sh; do
+  install -m 0755 "$n" "$DEST/${n:t}"
+  echo "deploy: installed notifiers/${n:t} -> $DEST/${n:t}"
+done
+
 mkdir -p "$ROUTES_DIR"
 if [[ ! -f "$ROUTES_DIR/routes.json" ]]; then
   cp "$SRC/routes.example.json" "$ROUTES_DIR/routes.json"

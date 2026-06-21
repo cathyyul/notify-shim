@@ -88,9 +88,22 @@ channel (Telegram chat id, LINE userId/groupId — no prefix).
 ./deploy.sh
 ```
 
-Installs `notify-dm`, `notify-group-couple`, and `notify_core.py` into
-`~/.openclaw/workspace/scripts/`, and seeds `~/.openclaw/notify/routes.json` from
-the example if it doesn't exist (then fill in real IDs).
+Installs `notify-dm`, `notify-group-couple`, `notify_core.py`, and every
+`notifiers/*.sh` into `~/.openclaw/workspace/scripts/`, and seeds
+`~/.openclaw/notify/routes.json` from the example if it doesn't exist (then fill
+in real IDs).
+
+## Workspace notifiers (`notifiers/`)
+
+LaunchAgent-driven scripts that have no other sub-project home live here and fan
+out through the shims. They install to the same `scripts/` paths the
+LaunchAgents already call, so no plist changes are needed.
+
+| Script | Trigger | Route |
+|--------|---------|-------|
+| `meal-reminder.sh` | breakfast/lunch/dinner LaunchAgents | `notify-dm` |
+| `slickdeals_notifier.sh` | Slickdeals gift-card monitor | `notify-dm` |
+| `weekly_offers_notifier.sh` | weekly standard-offers review | `notify-dm` |
 
 ## Test
 
