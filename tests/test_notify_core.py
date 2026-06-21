@@ -169,3 +169,15 @@ def test_send_one_does_not_duplicate_existing_dir(monkeypatch):
 
     parts = run.envs[0]["PATH"].split(os.pathsep)
     assert parts.count("/opt/homebrew/bin") == 1
+
+
+def test_send_one_bare_binary_name_does_not_inject_cwd(monkeypatch):
+    """A bare command name must NOT cause the caller's cwd to be prepended to
+    PATH (os.path.abspath('openclaw') would resolve to $PWD/openclaw)."""
+    run = make_run()
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    notify_core.send_one("line", "Uabc", "hi", dry_run=False, openclaw_bin="openclaw")
+
+    assert run.envs[0]["PATH"] == "/usr/bin:/bin"  # unchanged; no cwd injection

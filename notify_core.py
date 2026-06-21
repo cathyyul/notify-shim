@@ -69,8 +69,11 @@ def _env_with_binary_on_path(binary: str) -> dict:
     directory lets the CLI resolve node when shims run from a LaunchAgent.
     """
     env = dict(os.environ)
-    bindir = os.path.dirname(os.path.abspath(binary))
-    if bindir:
+    bindir = os.path.dirname(binary)
+    # Only act on an explicit absolute directory. A bare name ("openclaw") has
+    # no dirname, and a relative one must not cause the caller's cwd to be
+    # injected into PATH.
+    if bindir and os.path.isabs(bindir):
         parts = [p for p in env.get("PATH", "").split(os.pathsep) if p]
         if bindir not in parts:
             env["PATH"] = os.pathsep.join([bindir, *parts])
