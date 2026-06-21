@@ -114,6 +114,10 @@ def notify(route: str, message: str, *, routes_path: str | None = None,
 
     results = []
     for ch in channels:
+        # A channel can be turned off with "enabled": false (default true),
+        # so toggling where notifications go is a one-field edit in routes.json.
+        if not ch.get("enabled", True):
+            continue
         ok, detail = send_one(
             ch["channel"], ch["target"], message, dry_run=dry_run
         )
@@ -153,6 +157,11 @@ def main(argv=None) -> int:
     except (FileNotFoundError, KeyError, ValueError) as exc:
         print(f"notify: {exc}", file=sys.stderr)
         return 2
+
+    if not results:
+        print(f"notify: route '{args.route}' has no enabled channels — "
+              f"nothing sent", file=sys.stderr)
+        return 0
 
     failed = [r for r in results if not r[2]]
     for channel, target, ok, detail in results:

@@ -3,7 +3,8 @@
     "description": "Yuting personal DM",
     "channels": [
       { "channel": "telegram", "target": "TELEGRAM_DM_CHAT_ID" },
-      { "channel": "line", "target": "LINE_USER_ID" }
+      { "channel": "line", "target": "LINE_USER_ID" },
+      { "channel": "whatsapp", "target": "WHATSAPP_E164_NUMBER", "enabled": false }
     ]
   },
   "group-couple": {
