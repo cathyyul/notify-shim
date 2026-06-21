@@ -3,6 +3,7 @@
 No network / no openclaw binary: subprocess.run is monkeypatched.
 """
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -50,14 +51,16 @@ def make_run(fail_targets=()):
     fail_targets return a non-zero exit code."""
     calls = []
 
-    def _run(cmd, capture_output=False, text=False):
+    def _run(cmd, capture_output=False, text=False, env=None):
         calls.append(cmd)
+        _run.envs.append(env)
         target = cmd[cmd.index("--target") + 1]
         if target in fail_targets:
             return FakeProc(1, stderr=f"boom for {target}")
         return FakeProc(0, stdout="✅ sent")
 
     _run.calls = calls
+    _run.envs = []
     return _run
 
 
@@ -135,3 +138,46 @@ def test_positional_message_joined(monkeypatch, routes_file):
     rc = notify_core.main(["--route", "dm", "hello", "world", "--routes", routes_file])
     assert rc == 0
     assert run.calls[0][run.calls[0].index("--message") + 1] == "hello world"
+
+
+def test_send_one_prepends_binary_dir_to_path(monkeypatch):
+    """openclaw (a Node CLI) needs its own dir on PATH to find node when run
+    under a minimal launchd environment."""
+    run = make_run()
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    ok, _detail = notify_core.send_one(
+        "line", "Uabc", "hi", dry_run=False,
+        openclaw_bin="/opt/homebrew/bin/openclaw",
+    )
+
+    assert ok
+    env = run.envs[0]
+    assert env is not None
+    assert env["PATH"].split(os.pathsep)[0] == "/opt/homebrew/bin"
+    assert "/usr/bin" in env["PATH"].split(os.pathsep)
+
+
+def test_send_one_does_not_duplicate_existing_dir(monkeypatch):
+    run = make_run()
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setenv("PATH", "/opt/homebrew/bin:/usr/bin")
+
+    notify_core.send_one("line", "Uabc", "hi", dry_run=False,
+                         openclaw_bin="/opt/homebrew/bin/openclaw")
+
+    parts = run.envs[0]["PATH"].split(os.pathsep)
+    assert parts.count("/opt/homebrew/bin") == 1
+
+
+def test_send_one_bare_binary_name_does_not_inject_cwd(monkeypatch):
+    """A bare command name must NOT cause the caller's cwd to be prepended to
+    PATH (os.path.abspath('openclaw') would resolve to $PWD/openclaw)."""
+    run = make_run()
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    notify_core.send_one("line", "Uabc", "hi", dry_run=False, openclaw_bin="openclaw")
+
+    assert run.envs[0]["PATH"] == "/usr/bin:/bin"  # unchanged; no cwd injection
