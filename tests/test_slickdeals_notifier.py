@@ -24,6 +24,7 @@ def _run(tmp_path, monitor_body):
     mon = tmp_path / "monitor.py"
     mon.write_text(monitor_body)
     env = dict(os.environ,
+               WORKSPACE_DIR=str(tmp_path),
                NOTIFY_DM_BIN=str(notify),
                SLICKDEALS_MONITOR=str(mon),
                PYTHON_BIN="/usr/bin/python3")

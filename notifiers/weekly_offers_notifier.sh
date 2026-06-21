@@ -3,9 +3,9 @@
 # is output, notify Yuting via the notify-dm shim (Telegram + LINE).
 set -euo pipefail
 
-WORKSPACE_DIR="/Users/claw/.openclaw/workspace"
-PYTHON_BIN="/usr/bin/python3"
-SCRIPT_PATH="$WORKSPACE_DIR/scripts/weekly_standard_offers_review.py"
+WORKSPACE_DIR="${WORKSPACE_DIR:-/Users/claw/.openclaw/workspace}"
+PYTHON_BIN="${PYTHON_BIN:-/usr/bin/python3}"
+SCRIPT_PATH="${WEEKLY_OFFERS_REVIEW:-$WORKSPACE_DIR/scripts/weekly_standard_offers_review.py}"
 NOTIFY_DM="${NOTIFY_DM_BIN:-$WORKSPACE_DIR/scripts/notify-dm}"
 
 cd "$WORKSPACE_DIR"
