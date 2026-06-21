@@ -1,2 +1,101 @@
 # notify-shim
-Multi-channel notification shims (Telegram + LINE mirroring) for the OpenClaw workspace
+
+Multi-channel notification **shims** for the OpenClaw workspace.
+
+A script that wants to notify Yuting calls a shim (e.g. `notify-dm`) instead of
+talking to Telegram directly. The shim looks up the **route** in a config file
+and fans the same message out to every channel on that route. Today that's
+Telegram + LINE; adding or removing a channel later is a config edit, not a code
+change.
+
+> Origin: [cathyyul/mac-scripts#5](https://github.com/cathyyul/mac-scripts/issues/5)
+> asked for all Telegram notifications to be mirrored to LINE. That repo is
+> photo-sync; the notification layer lives here instead.
+
+## Shims
+
+| Shim | Route | Channels (current) |
+|------|-------|--------------------|
+| `notify-dm` | `dm` | Telegram DM + LINE DM |
+| `notify-group-couple` | `group-couple` | Telegram `小寶murmur` + LINE `海老群` |
+
+Naming convention: a future group gets its own shim `notify-group-<name>` backed
+by a matching route in `routes.json`.
+
+## Usage
+
+```sh
+notify-dm "晚餐時間到了 🍽️"
+echo "multi-line\nbody" | notify-dm
+notify-group-couple "這週要買的東西…"
+notify-dm --dry-run "preview, nothing is sent"
+```
+
+Exit code is **0 only if every channel succeeded**. If any channel fails the
+shim prints a per-channel summary to stderr and exits non-zero — a Telegram
+success never hides a LINE failure.
+
+## Config (`routes.json`)
+
+Real chat/user/group IDs are **not** in this repo. They live in a local,
+gitignored file (default `~/.openclaw/notify/routes.json`). The repo ships
+[`routes.example.json`](routes.example.json) with placeholders.
+
+```json
+{
+  "dm": {
+    "description": "Yuting personal DM",
+    "channels": [
+      { "channel": "telegram", "target": "<telegram chat id>" },
+      { "channel": "line", "target": "<line user id>" }
+    ]
+  },
+  "group-couple": {
+    "description": "Couple group — Telegram 小寶murmur / LINE 海老群",
+    "channels": [
+      { "channel": "telegram", "target": "<telegram group id>" },
+      { "channel": "line", "target": "<line group id>" }
+    ]
+  }
+}
+```
+
+Resolution order for the config path: `$NOTIFY_ROUTES` →
+`~/.openclaw/notify/routes.json`.
+
+- **Add/remove a channel** for a route: edit that route's `channels` array.
+- **Add a new group**: add a route, then add a `notify-group-<name>` wrapper
+  (copy an existing one, change `--route`).
+
+## Delivery
+
+Each channel is delivered with:
+
+```sh
+openclaw message send --channel <channel> --target <target> --message <text>
+```
+
+so the **OpenClaw gateway must be running**. `--target` is the raw id per
+channel (Telegram chat id, LINE userId/groupId — no prefix).
+
+> ⚠️ `openclaw message send --dry-run` is a *preview that still validates the
+> target*; it does not deliver. The shim's own `--dry-run` is genuinely safe and
+> never invokes openclaw at all.
+
+## Deploy
+
+```sh
+./deploy.sh
+```
+
+Installs `notify-dm`, `notify-group-couple`, and `notify_core.py` into
+`~/.openclaw/workspace/scripts/`, and seeds `~/.openclaw/notify/routes.json` from
+the example if it doesn't exist (then fill in real IDs).
+
+## Test
+
+```sh
+python3 -m pytest tests/ -q
+```
+
+Tests mock `subprocess.run`, so no gateway or network is needed.

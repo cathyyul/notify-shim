@@ -1,0 +1,16 @@
+{
+  "dm": {
+    "description": "Yuting personal DM",
+    "channels": [
+      { "channel": "telegram", "target": "TELEGRAM_DM_CHAT_ID" },
+      { "channel": "line", "target": "LINE_USER_ID" }
+    ]
+  },
+  "group-couple": {
+    "description": "Couple group — Telegram 小寶murmur / LINE 海老群",
+    "channels": [
+      { "channel": "telegram", "target": "TELEGRAM_GROUP_ID" },
+      { "channel": "line", "target": "LINE_GROUP_ID" }
+    ]
+  }
+}
