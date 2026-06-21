@@ -52,3 +52,11 @@ def test_no_deliver_skips_both(tmp_path):
                                  extra_args=("--no-deliver",))
     assert proc.returncode == 0
     assert not dm_out.exists() and not grp_out.exists()
+
+
+def test_review_failure_surfaces_error_and_does_not_send(tmp_path):
+    body = 'import sys\nsys.stderr.write("BOOM review crashed\\n")\nsys.exit(3)\n'
+    proc, dm_out, grp_out = _run(tmp_path, body)
+    assert proc.returncode != 0
+    assert "BOOM review crashed" in proc.stderr
+    assert not dm_out.exists() and not grp_out.exists()

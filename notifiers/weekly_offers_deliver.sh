@@ -21,12 +21,10 @@ REVIEW="${WEEKLY_OFFERS_REVIEW:-$SCRIPT_DIR/weekly_standard_offers_review.py}"
 NOTIFY_DM="${NOTIFY_DM_BIN:-$SCRIPT_DIR/notify-dm}"
 NOTIFY_GROUP="${NOTIFY_GROUP_COUPLE_BIN:-$SCRIPT_DIR/notify-group-couple}"
 
-raw_output="$("$PYTHON_BIN" "$REVIEW" 2>&1)"
-exit_code=$?
-
-if [[ $exit_code -ne 0 ]]; then
-  echo "weekly_standard_offers_review.py failed (exit $exit_code): $raw_output" >&2
-  exit $exit_code
+# if! (not a bare assignment) so set -e doesn't abort before we can report.
+if ! raw_output="$("$PYTHON_BIN" "$REVIEW" 2>&1)"; then
+  echo "weekly_standard_offers_review.py failed: $raw_output" >&2
+  exit 1
 fi
 
 # Format full list for delivery

@@ -52,3 +52,11 @@ def test_no_deliver_flag_skips_send(tmp_path):
     assert proc.returncode == 0, proc.stderr
     assert not sent.exists()
     assert "🛒 Slickdeals 監控" in proc.stdout
+
+
+def test_monitor_failure_surfaces_error_and_does_not_send(tmp_path):
+    body = 'import sys\nsys.stderr.write("BOOM monitor crashed\\n")\nsys.exit(3)\n'
+    proc, sent = _run(tmp_path, body)
+    assert proc.returncode != 0
+    assert "BOOM monitor crashed" in proc.stderr  # error must not be swallowed
+    assert not sent.exists()
