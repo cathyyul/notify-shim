@@ -92,6 +92,8 @@ def http_post(url: str, headers: dict[str, str] | None = None,
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         return HttpResult(status_code=exc.code, body=body)
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        return HttpResult(status_code=0, body=str(exc))
 
 
 def run_command(cmd: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
@@ -136,6 +138,14 @@ def check_line_local_webhook(gateway_port: int, timeout: float) -> CheckResult:
         data=b"{}",
         timeout=timeout,
     )
+    if result.status_code == 0:
+        return CheckResult(
+            channel="line",
+            ok=False,
+            status="line_local_route_unreachable",
+            detail=f"Local /line/webhook could not be reached: {result.body[:240]}",
+            suggested_next_step="Restart OpenClaw gateway, then retry the local LINE route check.",
+        )
     if result.status_code != 404:
         return CheckResult("line", True, "line_local_route_present",
                            f"Local /line/webhook returned {result.status_code}, not 404")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notifiers"))
@@ -41,6 +42,32 @@ def test_line_local_webhook_fails_on_404(monkeypatch):
 
     assert result.ok is False
     assert result.status == "line_local_route_missing"
+    assert "Restart OpenClaw gateway" in result.suggested_next_step
+
+
+def test_http_post_converts_url_error_to_result(monkeypatch):
+    def raise_url_error(*args, **kwargs):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", raise_url_error)
+
+    result = mod.http_post("http://127.0.0.1:18789/line/webhook", timeout=1)
+
+    assert result.status_code == 0
+    assert "connection refused" in result.body
+
+
+def test_line_local_webhook_unreachable_is_unhealthy(monkeypatch):
+    monkeypatch.setattr(
+        mod,
+        "http_post",
+        lambda *a, **k: mod.HttpResult(status_code=0, body="connection refused"),
+    )
+
+    result = mod.check_line_local_webhook(gateway_port=18789, timeout=1)
+
+    assert result.ok is False
+    assert result.status == "line_local_route_unreachable"
     assert "Restart OpenClaw gateway" in result.suggested_next_step
 
 

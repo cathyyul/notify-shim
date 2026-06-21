@@ -108,6 +108,10 @@ installs bundled LaunchAgent plist files into `~/Library/LaunchAgents/`, and
 seeds `~/.openclaw/notify/routes.json` from the example if it doesn't exist
 (then fill in real IDs).
 
+Bundled plist files use `__HOME__` placeholders in the repo. `deploy.sh`
+replaces them with the current `$HOME` while installing to
+`~/Library/LaunchAgents/`.
+
 Deploy only copies plist files. Load or reload them explicitly after review:
 
 ```sh

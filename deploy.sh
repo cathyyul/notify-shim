@@ -34,7 +34,10 @@ done
 
 if [[ -d "$LAUNCHAGENTS_DIR" ]]; then
   for p in "$SRC"/launchagents/*.plist; do
-    install -m 0644 "$p" "$LAUNCHAGENTS_DIR/${p:t}"
+    tmp="$(mktemp)"
+    sed "s|__HOME__|$HOME|g" "$p" > "$tmp"
+    install -m 0644 "$tmp" "$LAUNCHAGENTS_DIR/${p:t}"
+    rm -f "$tmp"
     echo "deploy: installed launchagents/${p:t} -> $LAUNCHAGENTS_DIR/${p:t}"
   done
 else
