@@ -11,6 +11,15 @@ DEST="${NOTIFY_DEST:-$HOME/.openclaw/workspace/scripts}"
 ROUTES_DIR="${NOTIFY_ROUTES_DIR:-$HOME/.openclaw/notify}"
 LAUNCHAGENTS_DIR="${NOTIFY_LAUNCHAGENTS_DIR:-$HOME/Library/LaunchAgents}"
 LOGS_DIR="$HOME/.openclaw/workspace/logs"
+OPENCLAW_BIN="${OPENCLAW_BIN:-$(command -v openclaw || true)}"
+if [[ -z "$OPENCLAW_BIN" ]]; then
+  for candidate in /opt/homebrew/bin/openclaw /usr/local/bin/openclaw; do
+    if [[ -x "$candidate" ]]; then
+      OPENCLAW_BIN="$candidate"
+      break
+    fi
+  done
+fi
 
 if [[ ! -d "$DEST" ]]; then
   echo "deploy: destination not found: $DEST" >&2
@@ -37,7 +46,8 @@ if [[ -d "$LAUNCHAGENTS_DIR" ]]; then
   mkdir -p "$LOGS_DIR"
   for p in "$SRC"/launchagents/*.plist; do
     tmp="$(mktemp)"
-    sed "s|__HOME__|$HOME|g" "$p" > "$tmp"
+    sed -e "s|__HOME__|$HOME|g" \
+        -e "s|__OPENCLAW_BIN__|$OPENCLAW_BIN|g" "$p" > "$tmp"
     install -m 0644 "$tmp" "$LAUNCHAGENTS_DIR/${p:t}"
     rm -f "$tmp"
     echo "deploy: installed launchagents/${p:t} -> $LAUNCHAGENTS_DIR/${p:t}"

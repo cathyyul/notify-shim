@@ -21,6 +21,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -88,6 +89,19 @@ def get_line_token(config: dict[str, Any]) -> str | None:
     return token if isinstance(token, str) and token.strip() else None
 
 
+def default_openclaw_bin() -> str:
+    env_bin = os.environ.get("OPENCLAW_BIN")
+    if env_bin:
+        return env_bin
+    found = shutil.which("openclaw")
+    if found:
+        return found
+    for candidate in ("/opt/homebrew/bin/openclaw", "/usr/local/bin/openclaw"):
+        if Path(candidate).exists():
+            return candidate
+    return "openclaw"
+
+
 def http_post(url: str, headers: dict[str, str] | None = None,
               data: bytes = b"", timeout: float = 10.0) -> HttpResult:
     req = urllib.request.Request(url, data=data, headers=headers or {}, method="POST")
@@ -126,8 +140,26 @@ def check_line_official_webhook(config: dict[str, Any], timeout: float) -> Check
         timeout=timeout,
     )
     if 200 <= result.status_code < 300:
-        return CheckResult("line", True, "line_official_webhook_ok",
-                           f"LINE official webhook test returned {result.status_code}")
+        try:
+            payload = json.loads(result.body or "{}")
+        except json.JSONDecodeError as exc:
+            return CheckResult(
+                channel="line",
+                ok=False,
+                status="line_official_webhook_bad_json",
+                detail=f"LINE official webhook test returned invalid JSON: {exc}",
+                suggested_next_step="Inspect LINE webhook settings and retry the webhook test.",
+            )
+        if payload.get("success") is True:
+            return CheckResult("line", True, "line_official_webhook_ok",
+                               f"LINE official webhook test returned success=true")
+        return CheckResult(
+            channel="line",
+            ok=False,
+            status="line_official_webhook_failed",
+            detail=f"LINE official webhook test returned {result.status_code}: {result.body[:240]}",
+            suggested_next_step="Restart OpenClaw gateway, then retry LINE webhook verification.",
+        )
     return CheckResult(
         channel="line",
         ok=False,
@@ -178,9 +210,9 @@ def check_line(config: dict[str, Any], gateway_port: int, timeout: float) -> Che
     return CheckResult("line", False, failures[0].status, detail, next_steps)
 
 
-def check_whatsapp(timeout_ms: int) -> CheckResult:
+def check_whatsapp(timeout_ms: int, openclaw_bin: str) -> CheckResult:
     cmd = [
-        "openclaw", "channels", "status",
+        openclaw_bin, "channels", "status",
         "--channel", "whatsapp",
         "--probe",
         "--timeout", str(timeout_ms),
@@ -325,9 +357,9 @@ def send_notification(message: str, notify_bin: Path) -> None:
         print(f"notify: failed to invoke notify-dm: {exc}", file=sys.stderr)
 
 
-def restart_gateway(timeout: float = 60) -> CheckResult:
+def restart_gateway(openclaw_bin: str, timeout: float = 60) -> CheckResult:
     try:
-        proc = run_command(["openclaw", "gateway", "restart"], timeout=timeout)
+        proc = run_command([openclaw_bin, "gateway", "restart"], timeout=timeout)
     except Exception as exc:
         return CheckResult("gateway", False, "gateway_restart_error",
                            f"Failed to run gateway restart: {exc}")
@@ -349,14 +381,15 @@ def maybe_notify(unhealthy: list[CheckResult], recovery_mode: str, notify_bin: P
 
 
 def evaluate_channels(channels: list[str], config: dict[str, Any],
-                      gateway_port: int, timeout_ms: int) -> list[CheckResult]:
+                      gateway_port: int, timeout_ms: int,
+                      openclaw_bin: str) -> list[CheckResult]:
     requested = ["line", "whatsapp"] if "all" in channels else channels
     results: list[CheckResult] = []
     for channel in requested:
         if channel == "line":
             results.append(check_line(config, gateway_port, timeout_ms / 1000))
         elif channel == "whatsapp":
-            results.append(check_whatsapp(timeout_ms))
+            results.append(check_whatsapp(timeout_ms, openclaw_bin))
         else:
             results.append(CheckResult(channel, False, "unsupported_channel",
                                        f"Unsupported channel: {channel}"))
@@ -387,13 +420,18 @@ def main() -> int:
                         default=Path(os.environ.get("OPENCLAW_CONFIG_PATH", DEFAULT_CONFIG_FILE)))
     parser.add_argument("--notify-bin", type=Path,
                         default=Path(os.environ.get("NOTIFY_DM_BIN", DEFAULT_NOTIFY_DM_BIN)))
+    parser.add_argument("--openclaw-bin", default=default_openclaw_bin(),
+                        help="Path to openclaw CLI; use an absolute path for LaunchAgent runs")
     parser.add_argument("--json", action="store_true", help="Print machine-readable result")
     args = parser.parse_args()
 
     try:
         state = load_json(args.state_file)
         config = load_json(args.config_file)
-        results = evaluate_channels(args.channels, config, args.gateway_port, args.timeout_ms)
+        results = evaluate_channels(
+            args.channels, config, args.gateway_port, args.timeout_ms,
+            args.openclaw_bin,
+        )
         unhealthy = [result for result in results if not result.ok]
 
         recovery_result: CheckResult | None = None
@@ -405,11 +443,14 @@ def main() -> int:
             incident = active_incident(state, key)
             if args.recovery_mode == "restart":
                 if not incident.get("restart_attempted_at"):
-                    recovery_result = restart_gateway()
+                    recovery_result = restart_gateway(args.openclaw_bin)
                     incident["restart_attempted_at"] = iso_now()
                     if recovery_result.ok and args.post_restart_delay_sec > 0:
                         time.sleep(args.post_restart_delay_sec)
-                    results = evaluate_channels(args.channels, config, args.gateway_port, args.timeout_ms)
+                    results = evaluate_channels(
+                        args.channels, config, args.gateway_port, args.timeout_ms,
+                        args.openclaw_bin,
+                    )
                     unhealthy = [result for result in results if not result.ok]
                     incident["post_restart_results"] = [asdict(result) for result in results]
                     if unhealthy and args.notify:

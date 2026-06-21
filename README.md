@@ -108,9 +108,9 @@ installs bundled LaunchAgent plist files into `~/Library/LaunchAgents/`, and
 seeds `~/.openclaw/notify/routes.json` from the example if it doesn't exist
 (then fill in real IDs).
 
-Bundled plist files use `__HOME__` placeholders in the repo. `deploy.sh`
-replaces them with the current `$HOME` while installing to
-`~/Library/LaunchAgents/`. It also ensures
+Bundled plist files use `__HOME__` and `__OPENCLAW_BIN__` placeholders in the
+repo. `deploy.sh` replaces them with the current `$HOME` and detected
+`openclaw` binary path while installing to `~/Library/LaunchAgents/`. It also ensures
 `~/.openclaw/workspace/logs/` exists before installing the plist, since launchd
 requires the stdout/stderr directory to already exist.
 
@@ -179,6 +179,8 @@ Bundled LaunchAgent:
 - runs every 5 minutes
 - checks LINE + WhatsApp
 - uses `--notify --recovery-mode restart --cooldown-minutes 30`
+- passes an absolute `--openclaw-bin` path during deploy so launchd's minimal
+  PATH cannot hide the CLI
 - writes logs to
   `~/.openclaw/workspace/logs/openclaw-channel-watchdog.log`
 

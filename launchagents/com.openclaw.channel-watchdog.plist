@@ -15,6 +15,8 @@
     <string>--notify</string>
     <string>--recovery-mode</string>
     <string>restart</string>
+    <string>--openclaw-bin</string>
+    <string>__OPENCLAW_BIN__</string>
     <string>--cooldown-minutes</string>
     <string>30</string>
   </array>

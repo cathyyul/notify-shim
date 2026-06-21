@@ -91,7 +91,7 @@ def test_line_official_webhook_sends_json_content_type(monkeypatch):
 
     def fake_post(*args, **kwargs):
         calls.append((args, kwargs))
-        return mod.HttpResult(status_code=200, body="{}")
+        return mod.HttpResult(status_code=200, body='{"success": true}')
 
     monkeypatch.setattr(mod, "http_post", fake_post)
     result = mod.check_line_official_webhook(
@@ -102,6 +102,22 @@ def test_line_official_webhook_sends_json_content_type(monkeypatch):
     assert result.ok is True
     assert calls[0][1]["headers"]["Content-Type"] == "application/json"
     assert calls[0][1]["data"] == b"{}"
+
+
+def test_line_official_webhook_http_200_success_false_is_unhealthy(monkeypatch):
+    monkeypatch.setattr(
+        mod,
+        "http_post",
+        lambda *a, **k: mod.HttpResult(status_code=200, body='{"success": false}'),
+    )
+
+    result = mod.check_line_official_webhook(
+        {"channels": {"line": {"channelAccessToken": "token"}}},
+        timeout=1,
+    )
+
+    assert result.ok is False
+    assert result.status == "line_official_webhook_failed"
 
 
 def test_whatsapp_probe_healthy(monkeypatch):
@@ -123,7 +139,7 @@ def test_whatsapp_probe_healthy(monkeypatch):
         lambda cmd, timeout: _Proc(0, stdout=json.dumps(payload)),
     )
 
-    result = mod.check_whatsapp(timeout_ms=1000)
+    result = mod.check_whatsapp(timeout_ms=1000, openclaw_bin="/custom/openclaw")
 
     assert result.ok is True
     assert result.status == "healthy"
@@ -148,7 +164,7 @@ def test_whatsapp_probe_unlinked_suggests_relink(monkeypatch):
         lambda cmd, timeout: _Proc(0, stdout=json.dumps(payload)),
     )
 
-    result = mod.check_whatsapp(timeout_ms=1000)
+    result = mod.check_whatsapp(timeout_ms=1000, openclaw_bin="/custom/openclaw")
 
     assert result.ok is False
     assert result.status == "whatsapp_unhealthy"
@@ -162,7 +178,7 @@ def test_whatsapp_probe_nonzero_exit_is_unhealthy(monkeypatch):
         lambda cmd, timeout: _Proc(1, stderr="gateway unreachable"),
     )
 
-    result = mod.check_whatsapp(timeout_ms=1000)
+    result = mod.check_whatsapp(timeout_ms=1000, openclaw_bin="/custom/openclaw")
 
     assert result.ok is False
     assert result.status == "whatsapp_probe_failed"
@@ -177,7 +193,7 @@ def test_whatsapp_probe_handles_null_json_sections(monkeypatch):
         lambda cmd, timeout: _Proc(0, stdout=json.dumps(payload)),
     )
 
-    result = mod.check_whatsapp(timeout_ms=1000)
+    result = mod.check_whatsapp(timeout_ms=1000, openclaw_bin="/custom/openclaw")
 
     assert result.ok is False
     assert result.status == "whatsapp_unhealthy"
@@ -240,8 +256,9 @@ def test_restart_mode_rechecks_and_clears_incident_when_recovered(monkeypatch, t
             return [mod.CheckResult("whatsapp", False, "bad", "broken", "restart")]
         return [mod.CheckResult("whatsapp", True, "healthy", "ok")]
 
-    def fake_restart():
+    def fake_restart(openclaw_bin):
         calls["restart"] += 1
+        assert openclaw_bin == "openclaw"
         return mod.CheckResult("gateway", True, "gateway_restart_ok", "restarted")
 
     monkeypatch.setattr(mod, "evaluate_channels", fake_evaluate)
@@ -263,6 +280,7 @@ def test_restart_mode_rechecks_and_clears_incident_when_recovered(monkeypatch, t
             "--state-file", str(state_file),
             "--config-file", str(config_file),
             "--notify-bin", str(notify_bin),
+            "--openclaw-bin", "openclaw",
         ],
     )
 
@@ -294,7 +312,7 @@ def test_restart_mode_does_not_restart_same_incident_twice(monkeypatch, tmp_path
         "evaluate_channels",
         lambda *a, **k: [mod.CheckResult("whatsapp", False, "bad", "broken", "restart")],
     )
-    monkeypatch.setattr(mod, "restart_gateway", lambda: calls.__setitem__("restart", calls["restart"] + 1))
+    monkeypatch.setattr(mod, "restart_gateway", lambda openclaw_bin: calls.__setitem__("restart", calls["restart"] + 1))
     monkeypatch.setattr(mod, "send_notification", lambda *a, **k: calls.__setitem__("notify", calls["notify"] + 1))
     monkeypatch.setattr(
         sys,
@@ -324,7 +342,7 @@ def test_restart_gateway_returns_failure_detail(monkeypatch):
         lambda cmd, timeout: subprocess.CompletedProcess(cmd, 7, "", "nope"),
     )
 
-    result = mod.restart_gateway()
+    result = mod.restart_gateway("/custom/openclaw")
 
     assert result.ok is False
     assert result.status == "gateway_restart_failed"
