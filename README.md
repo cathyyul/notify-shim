@@ -103,9 +103,17 @@ channel (Telegram chat id, LINE userId/groupId — no prefix).
 ```
 
 Installs `notify-dm`, `notify-group-couple`, `notify_core.py`, and every
-`notifiers/*.sh` into `~/.openclaw/workspace/scripts/`, and seeds
-`~/.openclaw/notify/routes.json` from the example if it doesn't exist (then fill
-in real IDs).
+`notifiers/*.sh` / `notifiers/*.py` into `~/.openclaw/workspace/scripts/`,
+installs bundled LaunchAgent plist files into `~/Library/LaunchAgents/`, and
+seeds `~/.openclaw/notify/routes.json` from the example if it doesn't exist
+(then fill in real IDs).
+
+Deploy only copies plist files. Load or reload them explicitly after review:
+
+```sh
+launchctl unload ~/Library/LaunchAgents/com.openclaw.channel-watchdog.plist 2>/dev/null || true
+launchctl load ~/Library/LaunchAgents/com.openclaw.channel-watchdog.plist
+```
 
 ## Workspace notifiers (`notifiers/`)
 
@@ -118,6 +126,55 @@ LaunchAgents already call, so no plist changes are needed.
 | `meal-reminder.sh` | `meal-reminder-{breakfast,lunch,dinner}` | `notify-dm` |
 | `slickdeals_deliver.sh` | `slickdeals-monitor` | `notify-dm` |
 | `weekly_offers_deliver.sh` | `weekly-standard-offers` | `notify-dm` + `notify-group-couple` |
+| `openclaw_channel_watchdog.py` | `channel-watchdog` | `notify-dm` on unhealthy channels |
+
+## OpenClaw channel watchdog
+
+Issue [#13](https://github.com/cathyyul/notify-shim/issues/13) tracks the local
+mitigation for OpenClaw channel route/session loss. The watchdog can check LINE,
+WhatsApp, or both:
+
+```sh
+python3 notifiers/openclaw_channel_watchdog.py --channels line --notify
+python3 notifiers/openclaw_channel_watchdog.py --channels whatsapp --notify
+python3 notifiers/openclaw_channel_watchdog.py --channels line whatsapp --notify --recovery-mode restart
+```
+
+LINE checks:
+- LINE official webhook test endpoint
+- local `POST http://127.0.0.1:18789/line/webhook`, treating `404` as route missing
+
+WhatsApp checks:
+- `openclaw channels status --channel whatsapp --probe --json`
+- verifies configured, linked, running, connected, and `healthState=healthy`
+
+By default recovery is notify-only. `--recovery-mode restart` runs
+`openclaw gateway restart` at most once for the active failing channel set, then
+re-checks health. If the same channel remains unhealthy, later runs stop
+restarting and only alert through `notify-dm`, guarded by `--cooldown-minutes`
+(default 30). State is written to
+`~/.openclaw/workspace/data/health/openclaw-channel-watchdog.json`.
+
+Incident reset behavior:
+- The active incident is keyed by failing channel set, e.g. `line`,
+  `whatsapp`, or `line|whatsapp`.
+- A changing failure detail for the same still-unhealthy channel is treated as
+  the same incident, so it does not get another restart attempt.
+- After any run where all requested channels are healthy, the watchdog removes
+  `active_incident`; a later failure is then treated as a fresh incident and may
+  restart once again.
+- To manually allow another restart before a healthy pass, remove only the
+  `active_incident` key from
+  `~/.openclaw/workspace/data/health/openclaw-channel-watchdog.json`.
+
+Bundled LaunchAgent:
+
+- `launchagents/com.openclaw.channel-watchdog.plist`
+- runs every 5 minutes
+- checks LINE + WhatsApp
+- uses `--notify --recovery-mode restart --cooldown-minutes 30`
+- writes logs to
+  `~/.openclaw/workspace/logs/openclaw-channel-watchdog.log`
 
 ## Test
 

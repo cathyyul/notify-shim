@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.openclaw.channel-watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>/Users/claw/.openclaw/workspace/scripts/openclaw_channel_watchdog.py</string>
+    <string>--channels</string>
+    <string>line</string>
+    <string>whatsapp</string>
+    <string>--notify</string>
+    <string>--recovery-mode</string>
+    <string>restart</string>
+    <string>--cooldown-minutes</string>
+    <string>30</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/claw/.openclaw/workspace/logs/openclaw-channel-watchdog.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/claw/.openclaw/workspace/logs/openclaw-channel-watchdog.log</string>
+</dict>
+</plist>

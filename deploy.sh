@@ -9,6 +9,7 @@ set -euo pipefail
 SRC="${0:A:h}"
 DEST="${NOTIFY_DEST:-$HOME/.openclaw/workspace/scripts}"
 ROUTES_DIR="${NOTIFY_ROUTES_DIR:-$HOME/.openclaw/notify}"
+LAUNCHAGENTS_DIR="${NOTIFY_LAUNCHAGENTS_DIR:-$HOME/Library/LaunchAgents}"
 
 if [[ ! -d "$DEST" ]]; then
   echo "deploy: destination not found: $DEST" >&2
@@ -25,6 +26,20 @@ for n in "$SRC"/notifiers/*.sh; do
   install -m 0755 "$n" "$DEST/${n:t}"
   echo "deploy: installed notifiers/${n:t} -> $DEST/${n:t}"
 done
+
+for n in "$SRC"/notifiers/*.py; do
+  install -m 0755 "$n" "$DEST/${n:t}"
+  echo "deploy: installed notifiers/${n:t} -> $DEST/${n:t}"
+done
+
+if [[ -d "$LAUNCHAGENTS_DIR" ]]; then
+  for p in "$SRC"/launchagents/*.plist; do
+    install -m 0644 "$p" "$LAUNCHAGENTS_DIR/${p:t}"
+    echo "deploy: installed launchagents/${p:t} -> $LAUNCHAGENTS_DIR/${p:t}"
+  done
+else
+  echo "deploy: LaunchAgents dir not found, skipped plist install: $LAUNCHAGENTS_DIR" >&2
+fi
 
 mkdir -p "$ROUTES_DIR"
 if [[ ! -f "$ROUTES_DIR/routes.json" ]]; then
