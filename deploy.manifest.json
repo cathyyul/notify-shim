@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cathyyul/workspace-infra/main/schemas/deploy.manifest.schema.json",
+  "repo": "notify-shim",
+  "github": "cathyyul/notify-shim",
+  "default_branch": "main",
+  "runtime": "deployed",
+  "targets": [
+    { "src": "notify-dm", "dest": "scripts/notify-dm", "mode": "managed", "chmod": "0755" },
+    { "src": "notify-group-couple", "dest": "scripts/notify-group-couple", "mode": "managed", "chmod": "0755" },
+    { "src": "notify_core.py", "dest": "scripts/notify_core.py", "mode": "managed", "chmod": "0644" },
+    { "src": "notifiers/*.sh", "dest": "scripts/", "mode": "managed", "chmod": "0755" },
+    { "src": "notifiers/*.py", "dest": "scripts/", "mode": "managed", "chmod": "0755" },
+    {
+      "src": "launchagents/com.openclaw.channel-watchdog.plist",
+      "dest": "~/Library/LaunchAgents/com.openclaw.channel-watchdog.plist",
+      "mode": "template",
+      "vars": ["HOME", "OPENCLAW_BIN"],
+      "chmod": "0644",
+      "launchctl": "copy-only",
+      "note": "現行 deploy.sh 只 install 不 launchctl（照實記錄；要改成 bootstrap 屬行為變更，走該 repo 的 PR）"
+    },
+    {
+      "src": "routes.example.json",
+      "dest": "~/.openclaw/notify/routes.json",
+      "mode": "seed",
+      "chmod": "0600",
+      "note": "真實 routes.json（含 chat/user/group id）住 repo 外，永不覆蓋既有"
+    }
+  ],
+  "removals": [],
+  "hooks": { "pre": null, "post": null }
+}
