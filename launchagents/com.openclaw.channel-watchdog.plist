@@ -8,7 +8,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
-    <string>__HOME__/.openclaw/workspace/scripts/openclaw_channel_watchdog.py</string>
+    <string>__WS__/scripts/openclaw_channel_watchdog.py</string>
     <string>--channels</string>
     <string>line</string>
     <string>whatsapp</string>
@@ -25,8 +25,8 @@
   <key>StartInterval</key>
   <integer>300</integer>
   <key>StandardOutPath</key>
-  <string>__HOME__/.openclaw/workspace/logs/openclaw-channel-watchdog.log</string>
+  <string>__WS__/logs/openclaw-channel-watchdog.log</string>
   <key>StandardErrorPath</key>
-  <string>__HOME__/.openclaw/workspace/logs/openclaw-channel-watchdog.log</string>
+  <string>__WS__/logs/openclaw-channel-watchdog.log</string>
 </dict>
 </plist>

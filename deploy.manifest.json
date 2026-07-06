@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cathyyul/workspace-infra/main/schemas/deploy.manifest.schema.json",
+  "repo": "notify-shim",
+  "github": "cathyyul/notify-shim",
+  "default_branch": "main",
+  "runtime": "deployed",
+  "targets": [
+    { "src": "notify-dm", "dest": "scripts/notify-dm", "mode": "managed", "chmod": "0755" },
+    { "src": "notify-group-couple", "dest": "scripts/notify-group-couple", "mode": "managed", "chmod": "0755" },
+    { "src": "notify_core.py", "dest": "scripts/notify_core.py", "mode": "managed", "chmod": "0644" },
+    { "src": "notifiers/*.sh", "dest": "scripts/", "mode": "managed", "chmod": "0755" },
+    { "src": "notifiers/*.py", "dest": "scripts/", "mode": "managed", "chmod": "0755" },
+    {
+      "src": "launchagents/com.openclaw.channel-watchdog.plist",
+      "dest": "~/Library/LaunchAgents/com.openclaw.channel-watchdog.plist",
+      "mode": "template",
+      "vars": ["WS", "OPENCLAW_BIN"],
+      "chmod": "0644",
+      "launchctl": "bootstrap",
+      "note": "channel-watchdog 是常駐服務（RunAtLoad）——bootstrap 讓載入變顯式且可重現。舊 deploy.sh 只 install 靠手動一次性載入＋RunAtLoad；改 bootstrap 是刻意的行為修正（S4，見 workspace-infra#15）。bootstrap 冪等：內容不變且已載入就不重載，不打斷運行中的 watchdog。"
+    },
+    {
+      "src": "routes.example.json",
+      "dest": "~/.openclaw/notify/routes.json",
+      "mode": "seed",
+      "chmod": "0600",
+      "note": "真實 routes.json（含 chat/user/group id）住 repo 外，永不覆蓋既有"
+    }
+  ],
+  "removals": [],
+  "hooks": { "pre": "hooks/pre_deploy.sh", "post": null }
+}
