@@ -14,7 +14,7 @@
       "src": "launchagents/com.openclaw.channel-watchdog.plist",
       "dest": "~/Library/LaunchAgents/com.openclaw.channel-watchdog.plist",
       "mode": "template",
-      "vars": ["HOME", "OPENCLAW_BIN"],
+      "vars": ["WS", "OPENCLAW_BIN"],
       "chmod": "0644",
       "launchctl": "bootstrap",
       "note": "channel-watchdog 是常駐服務（RunAtLoad）——bootstrap 讓載入變顯式且可重現。舊 deploy.sh 只 install 靠手動一次性載入＋RunAtLoad；改 bootstrap 是刻意的行為修正（S4，見 workspace-infra#15）。bootstrap 冪等：內容不變且已載入就不重載，不打斷運行中的 watchdog。"
