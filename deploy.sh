@@ -1,66 +1,26 @@
-#!/bin/zsh
-# deploy.sh — install the notify shims into the OpenClaw workspace scripts/
-# directory and seed a local routes.json (with real IDs) if one doesn't exist.
+#!/bin/bash
+# deploy.sh — thin shim (Phase 2 標準型)。
+# 所有 deploy 行為住 deploy.manifest.json，由共用 wsdeploy engine 執行
+# （cathyyul/workspace-infra；guards：ownership／orphan-edit／source-hygiene／lockfile）。
+# 不要在本檔加邏輯——加部署目標＝改 manifest；非宣告式長尾＝manifest hooks。
 #
-# The real routes.json lives OUTSIDE this repo (default ~/.openclaw/notify/)
-# so personal chat/user/group IDs are never committed to a public repo.
+# Engine 解析順序（bootstrap 不循環）：
+#   1. $WSDEPLOY（env seam）
+#   2. <本 repo>/bin/wsdeploy（workspace-infra self-hosting：engine 就在 repo 內）
+#   3. $WORKSPACE/scripts/wsdeploy（一般情況：workspace 部署版）
+#   4. workspace-infra checkout 的 bin/wsdeploy（workspace 版遺失時的復原路徑）
 set -euo pipefail
-
-SRC="${0:A:h}"
-DEST="${NOTIFY_DEST:-$HOME/.openclaw/workspace/scripts}"
-ROUTES_DIR="${NOTIFY_ROUTES_DIR:-$HOME/.openclaw/notify}"
-LAUNCHAGENTS_DIR="${NOTIFY_LAUNCHAGENTS_DIR:-$HOME/Library/LaunchAgents}"
-LOGS_DIR="$HOME/.openclaw/workspace/logs"
-OPENCLAW_BIN="${OPENCLAW_BIN:-$(command -v openclaw || true)}"
-if [[ -z "$OPENCLAW_BIN" ]]; then
-  for candidate in /opt/homebrew/bin/openclaw /usr/local/bin/openclaw; do
-    if [[ -x "$candidate" ]]; then
-      OPENCLAW_BIN="$candidate"
-      break
-    fi
-  done
-fi
-if [[ -z "$OPENCLAW_BIN" ]]; then
-  echo "deploy: openclaw binary not found; set OPENCLAW_BIN=/absolute/path/to/openclaw" >&2
-  exit 1
-fi
-
-if [[ ! -d "$DEST" ]]; then
-  echo "deploy: destination not found: $DEST" >&2
-  exit 1
-fi
-
-install -m 0755 "$SRC/notify-dm"            "$DEST/notify-dm"
-install -m 0755 "$SRC/notify-group-couple"  "$DEST/notify-group-couple"
-install -m 0644 "$SRC/notify_core.py"       "$DEST/notify_core.py"
-echo "deploy: installed notify-dm, notify-group-couple, notify_core.py -> $DEST"
-
-# Workspace notifier scripts (called by LaunchAgents at their existing paths).
-for n in "$SRC"/notifiers/*.sh; do
-  install -m 0755 "$n" "$DEST/${n:t}"
-  echo "deploy: installed notifiers/${n:t} -> $DEST/${n:t}"
+REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+WS="${OPENCLAW_WORKSPACE:-$HOME/.openclaw/workspace}"
+for c in "${WSDEPLOY:-}" \
+         "$REPO_DIR/bin/wsdeploy" \
+         "$WS/scripts/wsdeploy" \
+         "$WS/out/daily-review/projects/workspace-infra/bin/wsdeploy"; do
+  if [ -n "$c" ] && [ -x "$c" ]; then
+    exec "$c" --manifest "$REPO_DIR/deploy.manifest.json" "$@"
+  fi
 done
-
-for n in "$SRC"/notifiers/*.py; do
-  install -m 0755 "$n" "$DEST/${n:t}"
-  echo "deploy: installed notifiers/${n:t} -> $DEST/${n:t}"
-done
-
-mkdir -p "$LAUNCHAGENTS_DIR" "$LOGS_DIR"
-for p in "$SRC"/launchagents/*.plist; do
-  tmp="$(mktemp)"
-  sed -e "s|__HOME__|$HOME|g" \
-      -e "s|__OPENCLAW_BIN__|$OPENCLAW_BIN|g" "$p" > "$tmp"
-  install -m 0644 "$tmp" "$LAUNCHAGENTS_DIR/${p:t}"
-  rm -f "$tmp"
-  echo "deploy: installed launchagents/${p:t} -> $LAUNCHAGENTS_DIR/${p:t}"
-done
-
-mkdir -p "$ROUTES_DIR"
-if [[ ! -f "$ROUTES_DIR/routes.json" ]]; then
-  cp "$SRC/routes.example.json" "$ROUTES_DIR/routes.json"
-  chmod 0600 "$ROUTES_DIR/routes.json"
-  echo "deploy: seeded $ROUTES_DIR/routes.json from example — FILL IN real IDs"
-else
-  echo "deploy: kept existing $ROUTES_DIR/routes.json"
-fi
+echo "deploy: wsdeploy engine not found（查過：\$WSDEPLOY、$REPO_DIR/bin/、$WS/scripts/、infra checkout）" >&2
+echo "  bootstrap：clone https://github.com/cathyyul/workspace-infra 到" >&2
+echo "  $WS/out/daily-review/projects/workspace-infra，跑它的 deploy.sh（engine 自帶於 repo bin/），再重跑本 deploy。" >&2
+exit 1
