@@ -283,7 +283,8 @@ def test_ledger_skipped_on_dry_run(monkeypatch, routes_file):
     assert not Path(notify_core.ledger_path()).exists()
 
 
-def test_ledger_failure_never_breaks_delivery(monkeypatch, routes_file, tmp_path):
+def test_ledger_failure_never_breaks_delivery_but_logs(monkeypatch, routes_file,
+                                                        tmp_path, capsys):
     run = make_run()
     monkeypatch.setattr(notify_core.subprocess, "run", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
@@ -295,6 +296,21 @@ def test_ledger_failure_never_breaks_delivery(monkeypatch, routes_file, tmp_path
     results = notify_core.notify("dm", "hi", routes_path=routes_file)
 
     assert all(ok for *_, ok, _ in results)  # send succeeded despite ledger error
+    assert "send-ledger append failed" in capsys.readouterr().err  # not silent
+
+
+def test_ledger_records_per_channel_outcome(monkeypatch, routes_file):
+    """A nudge that points to one channel must be able to gate on that channel,
+    so the ledger records per-channel success, not just any_ok."""
+    run = make_run(fail_targets={"Cdef"})  # group-couple: LINE fails, Telegram ok
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    notify_core.notify("group-couple", "hi", routes_path=routes_file)
+
+    entry = json.loads(Path(notify_core.ledger_path()).read_text().splitlines()[-1])
+    assert entry["channels"] == {"telegram": True, "line": False}
+    assert entry["ok"] is True  # any_ok still recorded for back-compat
 
 
 def test_ledger_ts_has_microsecond_precision(monkeypatch, routes_file):

@@ -82,17 +82,43 @@ def _env_with_binary_on_path(binary: str) -> dict:
     return env
 
 
+class NotConfigured(Exception):
+    """Feature not set up (no file, or the untouched placeholder seed) — the
+    caller should exit quietly rather than alert."""
+
+
+def _placeholder(v: str) -> bool:
+    return (not v) or v.startswith("REPLACE_")
+
+
 def load_config(path: str):
-    """Return ``(to, from_account, route)``; raise ValueError if unfilled."""
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    """Return ``(to, from_account, route, require_channel)``.
+
+    Raises ``NotConfigured`` when the feature simply is not set up (missing file
+    or the untouched placeholder seed) so the caller can exit 0 quietly. Raises
+    ``ValueError`` when a *real* config is present but broken (malformed JSON or
+    a partially-filled/invalid address), so the caller can alert instead of
+    failing silently — the deploy seeds a placeholder, so "silently dead on a
+    bad config" is a real operational trap in the exact backstop path.
+    """
+    p = Path(path)
+    if not p.is_file():
+        raise NotConfigured(f"no review-email config at {path}")
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise ValueError(f"malformed JSON in {path}: {exc}")
     to = (data.get("to") or "").strip()
     frm = (data.get("from_account") or "").strip()
     route = (data.get("route") or "group-couple").strip() or "group-couple"
+    require_channel = (data.get("require_channel") or "telegram").strip() or "telegram"
+    if _placeholder(to) and _placeholder(frm):
+        raise NotConfigured(f"placeholder review-email config at {path} (not set up)")
     if not to or "@" not in to or to.startswith("REPLACE_"):
-        raise ValueError(f"review-email config '{path}' has no real 'to' address")
+        raise ValueError(f"review-email config '{path}' has no valid 'to' address")
     if not frm or "@" not in frm or frm.startswith("REPLACE_"):
-        raise ValueError(f"review-email config '{path}' has no real 'from_account'")
-    return to, frm, route
+        raise ValueError(f"review-email config '{path}' has no valid 'from_account'")
+    return to, frm, route, require_channel
 
 
 def _parse_ts(s):
@@ -124,8 +150,22 @@ def save_watermark(path: str, ts: dt.datetime) -> None:
                  encoding="utf-8")
 
 
-def unnotified(ledger_file: str, route: str, since):
-    """Sorted datetimes of successful ``route`` sends newer than ``since``.
+def _delivered(entry: dict, require_channel) -> bool:
+    """Whether the entry counts as delivered on the channel the nudge points to.
+
+    Prefers the per-channel record so a nudge that tells Chi to open Telegram
+    fires only when Telegram itself succeeded (not merely LINE). Falls back to
+    the legacy ``ok`` flag for older ledger lines without per-channel data.
+    """
+    channels = entry.get("channels")
+    if require_channel and isinstance(channels, dict):
+        return bool(channels.get(require_channel))
+    return bool(entry.get("ok"))
+
+
+def unnotified(ledger_file: str, route: str, since, require_channel=None):
+    """Sorted datetimes of ``route`` sends newer than ``since`` that reached the
+    channel the nudge points to (``require_channel``).
 
     ``since=None`` (no watermark yet) counts all matching entries. Timestamps
     are parsed to tz-aware datetimes so the comparison is correct across DST.
@@ -142,7 +182,7 @@ def unnotified(ledger_file: str, route: str, since):
             entry = json.loads(line)
         except ValueError:
             continue
-        if entry.get("route") != route or not entry.get("ok"):
+        if entry.get("route") != route or not _delivered(entry, require_channel):
             continue
         ts = _parse_ts(entry.get("ts"))
         if ts is None:
@@ -195,13 +235,19 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
 
     try:
-        to, frm, route = load_config(args.config)
-    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
-        print(f"couple-review-nudge: {exc}", file=sys.stderr)
+        to, frm, route, require_channel = load_config(args.config)
+    except NotConfigured as exc:
+        # Feature simply not set up — stay quiet, don't nag nightly.
+        print(f"couple-review-nudge: not configured ({exc}); skipping", file=sys.stderr)
+        return 0
+    except ValueError as exc:
+        # Real config present but broken — alert instead of dying silently.
+        print(f"couple-review-nudge: config error — {exc}", file=sys.stderr)
+        alert_failure(f"review-email config error: {exc}")
         return 2
 
     since = load_watermark(args.state)
-    pending = unnotified(args.ledger, route, since)
+    pending = unnotified(args.ledger, route, since, require_channel)
     if not pending:
         print(f"couple-review-nudge: no new '{route}' items since "
               f"{since.isoformat() if since else 'start'}; nothing to send")

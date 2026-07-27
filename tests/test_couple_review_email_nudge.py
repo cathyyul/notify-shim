@@ -19,15 +19,20 @@ def write_ledger(tmp_path, lines):
 
 
 def write_config(tmp_path, to="chi@example.com", frm="sender@gmail.com",
-                 route="group-couple"):
+                 route="group-couple", require_channel=None):
+    cfg = {"to": to, "from_account": frm, "route": route}
+    if require_channel is not None:
+        cfg["require_channel"] = require_channel
     p = tmp_path / "review-email.json"
-    p.write_text(json.dumps({"to": to, "from_account": frm, "route": route}),
-                 encoding="utf-8")
+    p.write_text(json.dumps(cfg), encoding="utf-8")
     return str(p)
 
 
-def entry(ts, route="group-couple", ok=True):
-    return {"ts": ts, "route": route, "ok": ok}
+def entry(ts, route="group-couple", ok=True, channels=None):
+    e = {"ts": ts, "route": route, "ok": ok}
+    if channels is not None:
+        e["channels"] = channels
+    return e
 
 
 class FakeProc:
@@ -64,6 +69,23 @@ def test_unnotified_only_after_watermark(tmp_path):
 
 def test_unnotified_missing_ledger_is_empty(tmp_path):
     assert nudge.unnotified(str(tmp_path / "nope.jsonl"), "group-couple", None) == []
+
+
+def test_unnotified_gates_on_required_channel(tmp_path):
+    """A nudge that points to Telegram must not count a LINE-only success."""
+    ledger = write_ledger(tmp_path, [
+        entry("2026-07-27T20:00:00-07:00", channels={"telegram": False, "line": True}),
+        entry("2026-07-27T21:00:00-07:00", channels={"telegram": True, "line": False}),
+    ])
+    got = nudge.unnotified(ledger, "group-couple", None, require_channel="telegram")
+    assert len(got) == 1  # only the entry where Telegram itself succeeded
+
+
+def test_unnotified_legacy_entry_falls_back_to_ok(tmp_path):
+    """Old ledger lines without per-channel data fall back to the ok flag."""
+    ledger = write_ledger(tmp_path, [entry("2026-07-27T21:00:00-07:00", ok=True)])
+    got = nudge.unnotified(ledger, "group-couple", None, require_channel="telegram")
+    assert len(got) == 1
 
 
 def test_unnotified_discriminates_within_same_second(tmp_path):
@@ -113,15 +135,34 @@ def test_watermark_round_trip(tmp_path):
 
 # --- load_config ---
 
-def test_load_config_rejects_placeholder(tmp_path):
-    p = write_config(tmp_path, to="REPLACE_WITH_RECIPIENT@example.com")
-    with pytest.raises(ValueError):
+def test_load_config_ok(tmp_path):
+    p = write_config(tmp_path)
+    assert nudge.load_config(p) == (
+        "chi@example.com", "sender@gmail.com", "group-couple", "telegram")
+
+
+def test_load_config_custom_require_channel(tmp_path):
+    p = write_config(tmp_path, require_channel="line")
+    assert nudge.load_config(p)[3] == "line"
+
+
+def test_load_config_missing_file_is_not_configured(tmp_path):
+    with pytest.raises(nudge.NotConfigured):
+        nudge.load_config(str(tmp_path / "nope.json"))
+
+
+def test_load_config_both_placeholder_is_not_configured(tmp_path):
+    p = write_config(tmp_path, to="REPLACE_WITH_RECIPIENT@example.com",
+                     frm="REPLACE_WITH_SENDER@gmail.com")
+    with pytest.raises(nudge.NotConfigured):
         nudge.load_config(p)
 
 
-def test_load_config_ok(tmp_path):
-    p = write_config(tmp_path)
-    assert nudge.load_config(p) == ("chi@example.com", "sender@gmail.com", "group-couple")
+def test_load_config_partial_invalid_is_error(tmp_path):
+    """A present-but-broken config (not a placeholder) is a real error to alert on."""
+    p = write_config(tmp_path, to="not-an-email")
+    with pytest.raises(ValueError):
+        nudge.load_config(p)
 
 
 # --- main ---
@@ -232,8 +273,35 @@ def test_main_send_failure_returns_2_and_alerts(tmp_path, monkeypatch):
     assert nudge.load_watermark(state) is None  # failed send did not advance watermark
 
 
-def test_main_bad_config_returns_2(tmp_path):
-    ledger = write_ledger(tmp_path, [])
-    cfg = write_config(tmp_path, to="REPLACE_WITH_RECIPIENT@example.com")
-    assert nudge.main(["--config", cfg, "--ledger", ledger,
-                       "--state", str(tmp_path / "s.json")]) == 2
+def test_main_missing_config_exits_0_quiet(tmp_path, monkeypatch):
+    """No config file = feature not set up → quiet exit 0, no send/alert."""
+    def boom(*a, **k):  # pragma: no cover
+        raise AssertionError("must not send/alert when not configured")
+    monkeypatch.setattr(nudge.subprocess, "run", boom)
+    rc = nudge.main(["--config", str(tmp_path / "nope.json"),
+                     "--ledger", str(tmp_path / "l.jsonl"),
+                     "--state", str(tmp_path / "s.json")])
+    assert rc == 0
+
+
+def test_main_placeholder_config_exits_0_quiet(tmp_path, monkeypatch):
+    """Untouched placeholder seed → not set up → quiet exit 0, no nightly nag."""
+    cfg = write_config(tmp_path, to="REPLACE_WITH_RECIPIENT@example.com",
+                       frm="REPLACE_WITH_SENDER@gmail.com")
+    def boom(*a, **k):  # pragma: no cover
+        raise AssertionError("must not send/alert on placeholder config")
+    monkeypatch.setattr(nudge.subprocess, "run", boom)
+    rc = nudge.main(["--config", cfg, "--ledger", str(tmp_path / "l.jsonl"),
+                     "--state", str(tmp_path / "s.json")])
+    assert rc == 0
+
+
+def test_main_broken_config_alerts_and_exits_2(tmp_path, monkeypatch):
+    """A present-but-broken config must alert, not die silently."""
+    cfg = write_config(tmp_path, to="not-an-email")  # real-ish but invalid
+    alerts = []
+    monkeypatch.setattr(nudge.subprocess, "run", lambda cmd, **k: alerts.append(cmd))
+    rc = nudge.main(["--config", cfg, "--ledger", str(tmp_path / "l.jsonl"),
+                     "--state", str(tmp_path / "s.json")])
+    assert rc == 2
+    assert alerts and "config error" in " ".join(alerts[0])  # self-explaining alert fired

@@ -56,7 +56,7 @@ def _record_ledger(route: str, results, *, dry_run: bool) -> None:
     if dry_run:
         return
     try:
-        any_ok = any(ok for (_ch, _tgt, ok, _detail) in results)
+        channels = {ch: ok for (ch, _tgt, ok, _detail) in results}
         entry = {
             # Microsecond precision: the couple-group nudge watermark filters
             # with a strict ``ts > since``, so two sends in the same whole
@@ -64,14 +64,22 @@ def _record_ledger(route: str, results, *, dry_run: bool) -> None:
             # one would compare equal to the watermark and be skipped forever.
             "ts": dt.datetime.now().astimezone().isoformat(timespec="microseconds"),
             "route": route,
-            "ok": any_ok,
+            "ok": any(channels.values()),
+            # Per-channel outcome: a nudge that directs the reader to a specific
+            # channel must gate on THAT channel, not on "any channel succeeded"
+            # (LINE up but Telegram down must not trigger a "check Telegram").
+            "channels": channels,
         }
         path = Path(ledger_path())
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except Exception:
-        pass  # ledger is best-effort; never break notification delivery
+    except Exception as exc:
+        # Never break delivery — but don't fail silently either: the couple-group
+        # nudge relies on this ledger as its only source of truth, so a lost
+        # append must at least be visible in logs.
+        print(f"notify: send-ledger append failed ({exc}); "
+              f"'{route}' event not recorded", file=sys.stderr)
 
 
 def find_openclaw() -> str:
