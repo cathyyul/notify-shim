@@ -340,8 +340,13 @@ def main(argv=None) -> int:
         return 2
 
     if not args.dry_run:
-        # Advance to the newest message just covered — anything that arrived
-        # after our read (even during the send) is caught on the next run.
+        # Advance to the newest message just covered. The watermark is a
+        # wall-clock timestamp, so this is not a strict no-miss cursor: a
+        # same-microsecond concurrent write, or a backward clock adjustment
+        # landing an append with ts <= watermark after this read, could be
+        # skipped. Accepted as negligible for this single-machine, serial,
+        # nightly-job use case (notify-shim#20); an append-order cursor would
+        # be the belt-and-suspenders fix.
         try:
             save_watermark(args.state, pending[-1])
         except OSError as exc:
