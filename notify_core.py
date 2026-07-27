@@ -125,8 +125,16 @@ def _env_with_binary_on_path(binary: str) -> dict:
 
 
 def send_one(channel: str, target: str, message: str, *, dry_run: bool,
-             openclaw_bin: str | None = None):
-    """Send to one channel. Return ``(ok: bool, detail: str)``."""
+             openclaw_bin: str | None = None, timeout: int = 60):
+    """Send to one channel. Return ``(ok: bool, detail: str)`` — never raises.
+
+    A bounded timeout plus catching every OSError (not just a missing binary)
+    means one wedged/erroring channel becomes a normal per-channel failure
+    rather than aborting the whole fan-out. That matters because the caller
+    records the send-ledger only after the loop finishes: a later channel that
+    hung or raised would otherwise erase an already-successful earlier channel
+    (e.g. Telegram delivered, then LINE hangs) from the ledger entirely.
+    """
     binary = openclaw_bin or find_openclaw()
     cmd = [binary, "message", "send",
            "--channel", channel, "--target", target, "--message", message]
@@ -134,9 +142,11 @@ def send_one(channel: str, target: str, message: str, *, dry_run: bool,
         return True, "dry-run (not sent): " + " ".join(cmd[:-1] + ["<message>"])
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              env=_env_with_binary_on_path(binary))
-    except FileNotFoundError:
-        return False, f"openclaw binary not found: {binary}"
+                              env=_env_with_binary_on_path(binary), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout}s"
+    except OSError as exc:
+        return False, f"could not run openclaw ({exc})"
     detail = (proc.stdout + proc.stderr).strip()
     return proc.returncode == 0, detail
 

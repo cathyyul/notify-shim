@@ -179,6 +179,20 @@ def test_load_config_partial_invalid_is_error(tmp_path):
         nudge.load_config(p)
 
 
+def test_load_config_non_dict_root_is_error(tmp_path):
+    p = tmp_path / "review-email.json"
+    p.write_text("[]", encoding="utf-8")  # JSON array, not object
+    with pytest.raises(ValueError):
+        nudge.load_config(str(p))
+
+
+def test_load_config_non_string_field_is_error(tmp_path):
+    p = tmp_path / "review-email.json"
+    p.write_text(json.dumps({"to": 5, "from_account": "s@x.com"}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        nudge.load_config(str(p))
+
+
 # --- validate_route ---
 
 def _write_routes(tmp_path, data):
@@ -228,6 +242,12 @@ def test_validate_route_non_dict_routes_raises_valueerror(tmp_path):
     p.write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
     with pytest.raises(ValueError):
         nudge.validate_route("group-couple", "telegram", str(p))
+
+
+def test_validate_route_null_channels_raises_valueerror(tmp_path):
+    r = _write_routes(tmp_path, {"group-couple": {"channels": None}})
+    with pytest.raises(ValueError):  # not a TypeError from `for c in None`
+        nudge.validate_route("group-couple", "telegram", r)
 
 
 def test_alert_failure_uses_timeout(monkeypatch):
@@ -397,6 +417,32 @@ def test_main_broken_config_alerts_and_exits_2(tmp_path, monkeypatch):
                      "--state", str(tmp_path / "s.json")])
     assert rc == 2
     assert alerts and "config error" in " ".join(alerts[0])  # self-explaining alert fired
+
+
+def test_main_malformed_config_alerts_and_exits_2(tmp_path, monkeypatch):
+    """A parseable-but-malformed config (JSON array) must alert, not crash uncaught."""
+    p = tmp_path / "review-email.json"
+    p.write_text("[]", encoding="utf-8")
+    alerts = []
+    monkeypatch.setattr(nudge.subprocess, "run", lambda cmd, **k: alerts.append(cmd))
+    rc = nudge.main(["--config", str(p), "--ledger", str(tmp_path / "l.jsonl"),
+                     "--state", str(tmp_path / "s.json")])
+    assert rc == 2 and alerts
+
+
+def test_main_body_reflects_configured_channel(tmp_path, monkeypatch):
+    """With require_channel=line, the email must not tell Chi to open Telegram."""
+    ledger = write_ledger(tmp_path, [entry("2026-07-27T21:00:00-07:00",
+                                            channels={"telegram": False, "line": True})])
+    cfg = write_config(tmp_path, require_channel="line")
+    calls = []
+    monkeypatch.setattr(nudge.subprocess, "run",
+                        lambda cmd, **k: calls.append(cmd) or FakeProc(0))
+    monkeypatch.setattr(nudge, "find_gog", lambda: "gog")
+    rc = nudge.main(["--config", cfg, "--ledger", ledger, "--state", str(tmp_path / "s.json")])
+    assert rc == 0
+    body = calls[0][calls[0].index("--body") + 1]
+    assert "LINE" in body and "Telegram" not in body
 
 
 def test_main_typoed_route_alerts_and_exits_2(tmp_path, monkeypatch):

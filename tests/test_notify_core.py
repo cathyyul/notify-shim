@@ -57,7 +57,7 @@ def make_run(fail_targets=()):
     fail_targets return a non-zero exit code."""
     calls = []
 
-    def _run(cmd, capture_output=False, text=False, env=None):
+    def _run(cmd, capture_output=False, text=False, env=None, timeout=None):
         calls.append(cmd)
         _run.envs.append(env)
         target = cmd[cmd.index("--target") + 1]
@@ -189,6 +189,24 @@ def test_send_one_bare_binary_name_does_not_inject_cwd(monkeypatch):
     assert run.envs[0]["PATH"] == "/usr/bin:/bin"  # unchanged; no cwd injection
 
 
+def test_send_one_timeout_returns_false(monkeypatch):
+    def raise_timeout(*a, **k):
+        raise notify_core.subprocess.TimeoutExpired(cmd="openclaw", timeout=1)
+    monkeypatch.setattr(notify_core.subprocess, "run", raise_timeout)
+    ok, detail = notify_core.send_one("line", "Uabc", "hi", dry_run=False,
+                                      openclaw_bin="openclaw", timeout=1)
+    assert not ok and "timed out" in detail
+
+
+def test_send_one_oserror_returns_false(monkeypatch):
+    def raise_oserror(*a, **k):
+        raise PermissionError("denied")
+    monkeypatch.setattr(notify_core.subprocess, "run", raise_oserror)
+    ok, detail = notify_core.send_one("line", "Uabc", "hi", dry_run=False,
+                                      openclaw_bin="openclaw")
+    assert not ok and "could not run" in detail
+
+
 # --- per-channel enabled toggle ---
 
 DISABLED_ROUTES = {
@@ -311,6 +329,24 @@ def test_ledger_records_per_channel_outcome(monkeypatch, routes_file):
     entry = json.loads(Path(notify_core.ledger_path()).read_text().splitlines()[-1])
     assert entry["channels"] == {"telegram": True, "line": False}
     assert entry["ok"] is True  # any_ok still recorded for back-compat
+
+
+def test_ledger_written_even_when_a_later_channel_raises(monkeypatch, routes_file):
+    """A later channel that hangs/raises must not erase an earlier channel's
+    success: send_one never raises, so the loop finishes and the ledger is
+    written with the accumulated per-channel outcomes."""
+    def run(cmd, capture_output=False, text=False, env=None, timeout=None):
+        target = cmd[cmd.index("--target") + 1]
+        if target == "Cdef":  # LINE (second channel) raises
+            raise PermissionError("boom")
+        return FakeProc(0, stdout="ok")
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    notify_core.notify("group-couple", "hi", routes_path=routes_file)
+
+    entry = json.loads(Path(notify_core.ledger_path()).read_text().splitlines()[-1])
+    assert entry["channels"] == {"telegram": True, "line": False}  # telegram preserved
 
 
 def test_ledger_ts_has_microsecond_precision(monkeypatch, routes_file):

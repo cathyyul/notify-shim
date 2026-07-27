@@ -44,6 +44,17 @@ DEFAULT_ROUTES = Path.home() / ".openclaw" / "notify" / "routes.json"
 # ``shutil.which`` (Apple Silicon vs Intel Homebrew).
 _GOG_CANDIDATES = ("/opt/homebrew/bin/gog", "/usr/local/bin/gog")
 
+# Human labels for the channel the nudge directs the reader to. Kept in sync
+# with require_channel so a non-default channel never yields a wrong pointer.
+_CHANNEL_LABELS = {
+    "telegram": "Telegram（小寶murmur 群）",
+    "line": "LINE（海老群）",
+}
+
+
+def _channel_label(channel: str) -> str:
+    return _CHANNEL_LABELS.get(channel, channel)
+
 
 def find_gog() -> str:
     """Resolve the gog binary (env override > PATH > known install dirs)."""
@@ -92,6 +103,17 @@ def _placeholder(v: str) -> bool:
     return (not v) or v.startswith("REPLACE_")
 
 
+def _str_field(data: dict, key: str, default: str = "") -> str:
+    """Return a stripped string field; a present-but-non-string value is a
+    config error (→ ValueError → alert), not an uncaught AttributeError."""
+    v = data.get(key, default)
+    if v is None:
+        return default
+    if not isinstance(v, str):
+        raise ValueError(f"config field '{key}' must be a string, got {type(v).__name__}")
+    return v.strip()
+
+
 def load_config(path: str):
     """Return ``(to, from_account, route, require_channel)``.
 
@@ -109,10 +131,12 @@ def load_config(path: str):
         data = json.loads(p.read_text(encoding="utf-8"))
     except ValueError as exc:
         raise ValueError(f"malformed JSON in {path}: {exc}")
-    to = (data.get("to") or "").strip()
-    frm = (data.get("from_account") or "").strip()
-    route = (data.get("route") or "group-couple").strip() or "group-couple"
-    require_channel = (data.get("require_channel") or "telegram").strip() or "telegram"
+    if not isinstance(data, dict):
+        raise ValueError(f"review-email config {path} is not a JSON object")
+    to = _str_field(data, "to")
+    frm = _str_field(data, "from_account")
+    route = _str_field(data, "route", "group-couple") or "group-couple"
+    require_channel = _str_field(data, "require_channel", "telegram") or "telegram"
     if _placeholder(to) and _placeholder(frm):
         raise NotConfigured(f"placeholder review-email config at {path} (not set up)")
     if not to or "@" not in to or to.startswith("REPLACE_"):
@@ -146,8 +170,12 @@ def validate_route(route: str, require_channel: str, routes_path: str) -> None:
         raise ValueError(f"route '{route}' is not in routes config {routes_path}")
     if not isinstance(route_cfg, dict):
         raise ValueError(f"route '{route}' entry is malformed in {routes_path}")
-    channels = [c.get("channel") for c in route_cfg.get("channels", [])
-                if isinstance(c, dict)]
+    chans = route_cfg.get("channels")
+    if chans is None:
+        chans = []
+    if not isinstance(chans, list):
+        raise ValueError(f"route '{route}' channels is malformed in {routes_path}")
+    channels = [c.get("channel") for c in chans if isinstance(c, dict)]
     if require_channel not in channels:
         raise ValueError(
             f"require_channel '{require_channel}' is not a channel of route "
@@ -298,10 +326,11 @@ def main(argv=None) -> int:
         return 0
 
     n = len(pending)
-    subject = "Claw：小寶murmur 有東西要 review"
+    dest = _channel_label(require_channel)
+    subject = "Claw：有訊息要 review"
     body = (
-        f"小寶murmur 有 {n} 則新訊息等你 review。\n\n"
-        "請開 Telegram（小寶murmur 群）查看並回覆。\n\n"
+        f"{dest} 有 {n} 則新訊息等你 review。\n\n"
+        f"請開 {dest} 查看並回覆。\n\n"
         "— Claw"
     )
     ok, detail = send_email(find_gog(), frm, to, subject, body, dry_run=args.dry_run)
