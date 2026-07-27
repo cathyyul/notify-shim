@@ -22,6 +22,7 @@ Stdlib only; runs on the system ``python3`` (3.9) and the workspace venv (3.14).
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import os
 import shutil
@@ -36,6 +37,49 @@ def default_routes_paths() -> list[str]:
         os.environ.get("NOTIFY_ROUTES", "") or "",
         str(Path.home() / ".openclaw" / "notify" / "routes.json"),
     ]
+
+
+def ledger_path() -> str:
+    """Local JSONL send-ledger path (env override for tests)."""
+    return os.environ.get("NOTIFY_LEDGER", "") or str(
+        Path.home() / ".openclaw" / "notify" / "send-ledger.jsonl"
+    )
+
+
+def _record_ledger(route: str, results, *, dry_run: bool) -> None:
+    """Best-effort append of one send record; never raises.
+
+    A downstream digest (e.g. the couple-group evening email nudge) reads this
+    to learn whether anything was posted to a route today. A ledger write must
+    never affect notification delivery, so every error here is swallowed.
+    """
+    if dry_run:
+        return
+    try:
+        channels = {ch: ok for (ch, _tgt, ok, _detail) in results}
+        entry = {
+            # Microsecond precision: the couple-group nudge watermark filters
+            # with a strict ``ts > since``, so two sends in the same whole
+            # second must still get distinct, ordered timestamps or the later
+            # one would compare equal to the watermark and be skipped forever.
+            "ts": dt.datetime.now().astimezone().isoformat(timespec="microseconds"),
+            "route": route,
+            "ok": any(channels.values()),
+            # Per-channel outcome: a nudge that directs the reader to a specific
+            # channel must gate on THAT channel, not on "any channel succeeded"
+            # (LINE up but Telegram down must not trigger a "check Telegram").
+            "channels": channels,
+        }
+        path = Path(ledger_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        # Never break delivery — but don't fail silently either: the couple-group
+        # nudge relies on this ledger as its only source of truth, so a lost
+        # append must at least be visible in logs.
+        print(f"notify: send-ledger append failed ({exc}); "
+              f"'{route}' event not recorded", file=sys.stderr)
 
 
 def find_openclaw() -> str:
@@ -81,8 +125,16 @@ def _env_with_binary_on_path(binary: str) -> dict:
 
 
 def send_one(channel: str, target: str, message: str, *, dry_run: bool,
-             openclaw_bin: str | None = None):
-    """Send to one channel. Return ``(ok: bool, detail: str)``."""
+             openclaw_bin: str | None = None, timeout: int = 60):
+    """Send to one channel. Return ``(ok: bool, detail: str)`` — never raises.
+
+    A bounded timeout plus catching every OSError (not just a missing binary)
+    means one wedged/erroring channel becomes a normal per-channel failure
+    rather than aborting the whole fan-out. That matters because the caller
+    records the send-ledger only after the loop finishes: a later channel that
+    hung or raised would otherwise erase an already-successful earlier channel
+    (e.g. Telegram delivered, then LINE hangs) from the ledger entirely.
+    """
     binary = openclaw_bin or find_openclaw()
     cmd = [binary, "message", "send",
            "--channel", channel, "--target", target, "--message", message]
@@ -90,9 +142,11 @@ def send_one(channel: str, target: str, message: str, *, dry_run: bool,
         return True, "dry-run (not sent): " + " ".join(cmd[:-1] + ["<message>"])
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              env=_env_with_binary_on_path(binary))
-    except FileNotFoundError:
-        return False, f"openclaw binary not found: {binary}"
+                              env=_env_with_binary_on_path(binary), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout}s"
+    except OSError as exc:
+        return False, f"could not run openclaw ({exc})"
     detail = (proc.stdout + proc.stderr).strip()
     return proc.returncode == 0, detail
 
@@ -122,6 +176,7 @@ def notify(route: str, message: str, *, routes_path: str | None = None,
             ch["channel"], ch["target"], message, dry_run=dry_run
         )
         results.append((ch["channel"], ch["target"], ok, detail))
+    _record_ledger(route, results, dry_run=dry_run)
     return results
 
 

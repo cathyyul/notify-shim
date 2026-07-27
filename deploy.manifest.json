@@ -20,11 +20,27 @@
       "note": "channel-watchdog 是常駐服務（RunAtLoad）——bootstrap 讓載入變顯式且可重現。舊 deploy.sh 只 install 靠手動一次性載入＋RunAtLoad；改 bootstrap 是刻意的行為修正（S4，見 workspace-infra#15）。bootstrap 冪等：內容不變且已載入就不重載，不打斷運行中的 watchdog。"
     },
     {
+      "src": "launchagents/com.openclaw.couple-review-nudge.plist",
+      "dest": "~/Library/LaunchAgents/com.openclaw.couple-review-nudge.plist",
+      "mode": "template",
+      "vars": ["WS"],
+      "chmod": "0644",
+      "launchctl": "bootstrap",
+      "note": "每日 21:00：若當日有 group-couple 送出，寄 nudge email 給 Chi（couple_review_email_nudge.py，讀 notify_core send-ledger）。"
+    },
+    {
       "src": "routes.example.json",
       "dest": "~/.openclaw/notify/routes.json",
       "mode": "seed",
       "chmod": "0600",
       "note": "真實 routes.json（含 chat/user/group id）住 repo 外，永不覆蓋既有"
+    },
+    {
+      "src": "review-email.example.json",
+      "dest": "~/.openclaw/notify/review-email.json",
+      "mode": "seed",
+      "chmod": "0600",
+      "note": "真實收件人（Chi email）+ 寄件帳號住 repo 外，永不覆蓋既有"
     }
   ],
   "removals": [],

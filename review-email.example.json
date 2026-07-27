@@ -1,0 +1,5 @@
+{
+  "to": "REPLACE_WITH_RECIPIENT@example.com",
+  "from_account": "REPLACE_WITH_SENDER@gmail.com",
+  "route": "group-couple"
+}
