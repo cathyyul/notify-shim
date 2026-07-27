@@ -38,6 +38,7 @@ from pathlib import Path
 DEFAULT_CONFIG = Path.home() / ".openclaw" / "notify" / "review-email.json"
 DEFAULT_LEDGER = Path.home() / ".openclaw" / "notify" / "send-ledger.jsonl"
 DEFAULT_STATE = Path.home() / ".openclaw" / "notify" / "review-email.state.json"
+DEFAULT_ROUTES = Path.home() / ".openclaw" / "notify" / "routes.json"
 
 # gog install locations to probe when launchd's minimal PATH hides it from
 # ``shutil.which`` (Apple Silicon vs Intel Homebrew).
@@ -121,6 +122,30 @@ def load_config(path: str):
     return to, frm, route, require_channel
 
 
+def validate_route(route: str, require_channel: str, routes_path: str) -> None:
+    """Raise ValueError if ``route`` / ``require_channel`` don't exist in the
+    routes config, so a typo surfaces as a config error (alert) instead of a
+    forever-empty 'nothing to send'.
+
+    Best-effort: if routes.json is absent/unreadable we cannot validate, so we
+    skip rather than invent a new failure mode.
+    """
+    p = Path(routes_path)
+    if not p.is_file():
+        return
+    try:
+        routes = json.loads(p.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return
+    if route not in routes:
+        raise ValueError(f"route '{route}' is not in routes config {routes_path}")
+    channels = [c.get("channel") for c in routes[route].get("channels", [])]
+    if require_channel not in channels:
+        raise ValueError(
+            f"require_channel '{require_channel}' is not a channel of route "
+            f"'{route}' (has: {', '.join(c for c in channels if c)})")
+
+
 def _parse_ts(s):
     try:
         return dt.datetime.fromisoformat(str(s))
@@ -194,17 +219,25 @@ def unnotified(ledger_file: str, route: str, since, require_channel=None):
 
 
 def send_email(gog_bin: str, account: str, to: str, subject: str, body: str,
-               *, dry_run: bool):
-    """Send the nudge via gog. Return ``(ok, detail)``."""
+               *, dry_run: bool, timeout: int = 120):
+    """Send the nudge via gog. Return ``(ok, detail)`` — never raises, so the
+    caller's failure-alert path always runs.
+
+    A bounded timeout stops a stalled gog (network/auth) from wedging the
+    LaunchAgent indefinitely; TimeoutExpired and any OSError (not just a missing
+    binary) become a failed-send result instead of an uncaught crash.
+    """
     cmd = [gog_bin, "send", "--account", account, "--to", to,
            "--subject", subject, "--body", body, "--no-input"]
     if dry_run:
         cmd.insert(2, "-n")
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
-                              env=_env_with_binary_on_path(gog_bin))
-    except FileNotFoundError:
-        return False, f"gog binary not found: {gog_bin}"
+                              env=_env_with_binary_on_path(gog_bin), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"gog send timed out after {timeout}s"
+    except OSError as exc:
+        return False, f"gog send could not run ({exc})"
     return proc.returncode == 0, (proc.stdout + proc.stderr).strip()
 
 
@@ -230,12 +263,15 @@ def main(argv=None) -> int:
                     default=os.environ.get("NOTIFY_LEDGER") or str(DEFAULT_LEDGER))
     ap.add_argument("--state",
                     default=os.environ.get("NOTIFY_REVIEW_STATE") or str(DEFAULT_STATE))
+    ap.add_argument("--routes",
+                    default=os.environ.get("NOTIFY_ROUTES") or str(DEFAULT_ROUTES))
     ap.add_argument("--dry-run", action="store_true",
                     help="pass gog -n and do not advance the watermark")
     args = ap.parse_args(argv)
 
     try:
         to, frm, route, require_channel = load_config(args.config)
+        validate_route(route, require_channel, args.routes)
     except NotConfigured as exc:
         # Feature simply not set up — stay quiet, don't nag nightly.
         print(f"couple-review-nudge: not configured ({exc}); skipping", file=sys.stderr)

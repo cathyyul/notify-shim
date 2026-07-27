@@ -12,6 +12,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notifiers"))
 import couple_review_email_nudge as nudge  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _routes_env(tmp_path, monkeypatch):
+    """Hermetic routes.json for validate_route (also shields the real one)."""
+    p = tmp_path / "routes.json"
+    p.write_text(json.dumps({
+        "group-couple": {"channels": [
+            {"channel": "telegram", "target": "-1"},
+            {"channel": "line", "target": "C1"},
+        ]},
+        "dm": {"channels": [{"channel": "telegram", "target": "1"}]},
+    }), encoding="utf-8")
+    monkeypatch.setenv("NOTIFY_ROUTES", str(p))
+
+
 def write_ledger(tmp_path, lines):
     p = tmp_path / "ledger.jsonl"
     p.write_text("".join(json.dumps(x) + "\n" for x in lines), encoding="utf-8")
@@ -165,6 +179,57 @@ def test_load_config_partial_invalid_is_error(tmp_path):
         nudge.load_config(p)
 
 
+# --- validate_route ---
+
+def _write_routes(tmp_path, data):
+    p = tmp_path / "r.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    return str(p)
+
+
+def test_validate_route_accepts_valid(tmp_path):
+    r = _write_routes(tmp_path, {"group-couple": {"channels": [
+        {"channel": "telegram", "target": "-1"}]}})
+    nudge.validate_route("group-couple", "telegram", r)  # no raise
+
+
+def test_validate_route_rejects_unknown_route(tmp_path):
+    r = _write_routes(tmp_path, {"group-couple": {"channels": [
+        {"channel": "telegram", "target": "-1"}]}})
+    with pytest.raises(ValueError):
+        nudge.validate_route("group-cuploe", "telegram", r)  # typo route
+
+
+def test_validate_route_rejects_unknown_channel(tmp_path):
+    r = _write_routes(tmp_path, {"group-couple": {"channels": [
+        {"channel": "telegram", "target": "-1"}]}})
+    with pytest.raises(ValueError):
+        nudge.validate_route("group-couple", "Telegram", r)  # wrong case
+
+
+def test_validate_route_skips_when_no_routes_file(tmp_path):
+    nudge.validate_route("anything", "whatever", str(tmp_path / "nope.json"))  # no raise
+
+
+# --- send_email robustness ---
+
+def test_send_email_timeout_returns_false(monkeypatch):
+    def raise_timeout(*a, **k):
+        raise nudge.subprocess.TimeoutExpired(cmd="gog", timeout=1)
+    monkeypatch.setattr(nudge.subprocess, "run", raise_timeout)
+    ok, detail = nudge.send_email("gog", "a@b.com", "c@d.com", "s", "b",
+                                  dry_run=False, timeout=1)
+    assert not ok and "timed out" in detail
+
+
+def test_send_email_oserror_returns_false(monkeypatch):
+    def raise_oserror(*a, **k):
+        raise PermissionError("denied")
+    monkeypatch.setattr(nudge.subprocess, "run", raise_oserror)
+    ok, detail = nudge.send_email("gog", "a@b.com", "c@d.com", "s", "b", dry_run=False)
+    assert not ok and "could not run" in detail
+
+
 # --- main ---
 
 def test_main_sends_and_advances_watermark(tmp_path, monkeypatch):
@@ -305,3 +370,17 @@ def test_main_broken_config_alerts_and_exits_2(tmp_path, monkeypatch):
                      "--state", str(tmp_path / "s.json")])
     assert rc == 2
     assert alerts and "config error" in " ".join(alerts[0])  # self-explaining alert fired
+
+
+def test_main_typoed_route_alerts_and_exits_2(tmp_path, monkeypatch):
+    """A route that doesn't exist in routes.json must alert, not silently no-op.
+
+    (routes.json is the hermetic one from the _routes_env fixture; it has
+    'group-couple' but not 'group-cuploe'.)"""
+    cfg = write_config(tmp_path, route="group-cuploe")  # typo
+    alerts = []
+    monkeypatch.setattr(nudge.subprocess, "run", lambda cmd, **k: alerts.append(cmd))
+    rc = nudge.main(["--config", cfg, "--ledger", str(tmp_path / "l.jsonl"),
+                     "--state", str(tmp_path / "s.json")])
+    assert rc == 2
+    assert alerts  # typo surfaced as an alert instead of a forever-empty scan
