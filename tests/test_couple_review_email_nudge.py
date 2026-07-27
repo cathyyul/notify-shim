@@ -211,6 +211,33 @@ def test_validate_route_skips_when_no_routes_file(tmp_path):
     nudge.validate_route("anything", "whatever", str(tmp_path / "nope.json"))  # no raise
 
 
+def test_validate_route_malformed_route_entry_raises_valueerror(tmp_path):
+    r = _write_routes(tmp_path, {"group-couple": []})  # list, not dict
+    with pytest.raises(ValueError):
+        nudge.validate_route("group-couple", "telegram", r)  # not AttributeError
+
+
+def test_validate_route_malformed_channels_do_not_crash(tmp_path):
+    r = _write_routes(tmp_path, {"group-couple": {"channels": ["telegram", 5]}})
+    with pytest.raises(ValueError):  # channel not found → ValueError, not AttributeError
+        nudge.validate_route("group-couple", "telegram", r)
+
+
+def test_validate_route_non_dict_routes_raises_valueerror(tmp_path):
+    p = tmp_path / "r.json"
+    p.write_text(json.dumps(["not", "a", "dict"]), encoding="utf-8")
+    with pytest.raises(ValueError):
+        nudge.validate_route("group-couple", "telegram", str(p))
+
+
+def test_alert_failure_uses_timeout(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(nudge.subprocess, "run",
+                        lambda cmd, **k: captured.update(k))
+    nudge.alert_failure("boom")
+    assert captured.get("timeout")  # bounded so a hung notify-dm can't wedge the job
+
+
 # --- send_email robustness ---
 
 def test_send_email_timeout_returns_false(monkeypatch):

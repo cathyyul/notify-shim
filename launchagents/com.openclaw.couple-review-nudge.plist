@@ -10,6 +10,11 @@
     <string>/usr/bin/python3</string>
     <string>__WS__/scripts/couple_review_email_nudge.py</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>OPENCLAW_WORKSPACE</key>
+    <string>__WS__</string>
+  </dict>
   <key>StartCalendarInterval</key>
   <dict>
     <key>Hour</key>

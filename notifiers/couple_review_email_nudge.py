@@ -137,9 +137,17 @@ def validate_route(route: str, require_channel: str, routes_path: str) -> None:
         routes = json.loads(p.read_text(encoding="utf-8"))
     except (ValueError, OSError):
         return
-    if route not in routes:
+    # Defensive against a parseable-but-malformed routes.json: turn any schema
+    # mismatch into a ValueError (→ alert) rather than an uncaught AttributeError.
+    if not isinstance(routes, dict):
+        raise ValueError(f"routes config {routes_path} is not a JSON object")
+    route_cfg = routes.get(route)
+    if route_cfg is None:
         raise ValueError(f"route '{route}' is not in routes config {routes_path}")
-    channels = [c.get("channel") for c in routes[route].get("channels", [])]
+    if not isinstance(route_cfg, dict):
+        raise ValueError(f"route '{route}' entry is malformed in {routes_path}")
+    channels = [c.get("channel") for c in route_cfg.get("channels", [])
+                if isinstance(c, dict)]
     if require_channel not in channels:
         raise ValueError(
             f"require_channel '{require_channel}' is not a channel of route "
@@ -251,9 +259,9 @@ def alert_failure(detail: str) -> None:
         "~/.openclaw/notify/review-email.json 收件人設定。"
     )
     try:
-        subprocess.run([bin_, msg], capture_output=True, text=True)
+        subprocess.run([bin_, msg], capture_output=True, text=True, timeout=30)
     except Exception:
-        pass
+        pass  # best-effort: a hung/broken notify-dm must not wedge the job either
 
 
 def main(argv=None) -> int:
