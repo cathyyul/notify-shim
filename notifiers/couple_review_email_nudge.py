@@ -38,12 +38,32 @@ from pathlib import Path
 DEFAULT_CONFIG = Path.home() / ".openclaw" / "notify" / "review-email.json"
 DEFAULT_LEDGER = Path.home() / ".openclaw" / "notify" / "send-ledger.jsonl"
 DEFAULT_STATE = Path.home() / ".openclaw" / "notify" / "review-email.state.json"
-DEFAULT_NOTIFY_DM_BIN = Path.home() / ".openclaw" / "workspace" / "scripts" / "notify-dm"
+
+# gog install locations to probe when launchd's minimal PATH hides it from
+# ``shutil.which`` (Apple Silicon vs Intel Homebrew).
+_GOG_CANDIDATES = ("/opt/homebrew/bin/gog", "/usr/local/bin/gog")
 
 
 def find_gog() -> str:
-    """Resolve the gog binary (env override > PATH > Homebrew default)."""
-    return os.environ.get("GOG_BIN") or shutil.which("gog") or "/opt/homebrew/bin/gog"
+    """Resolve the gog binary (env override > PATH > known install dirs)."""
+    env = os.environ.get("GOG_BIN")
+    if env:
+        return env
+    found = shutil.which("gog")
+    if found:
+        return found
+    for cand in _GOG_CANDIDATES:
+        if os.path.isfile(cand):
+            return cand
+    return _GOG_CANDIDATES[0]  # last-resort default
+
+
+def default_notify_dm_bin() -> str:
+    """notify-dm path, honoring a relocated workspace (OPENCLAW_WORKSPACE)."""
+    ws = os.environ.get("OPENCLAW_WORKSPACE") or str(
+        Path.home() / ".openclaw" / "workspace"
+    )
+    return str(Path(ws) / "scripts" / "notify-dm")
 
 
 def _env_with_binary_on_path(binary: str) -> dict:
@@ -98,7 +118,9 @@ def save_watermark(path: str, ts: dt.datetime) -> None:
     """Persist the watermark to the newest message just covered."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"last_notified_ts": ts.isoformat(timespec="seconds")}),
+    # Microsecond precision so the strict ``ts > since`` filter can still
+    # distinguish two sends that fell in the same whole second.
+    p.write_text(json.dumps({"last_notified_ts": ts.isoformat(timespec="microseconds")}),
                  encoding="utf-8")
 
 
@@ -148,7 +170,7 @@ def send_email(gog_bin: str, account: str, to: str, subject: str, body: str,
 
 def alert_failure(detail: str) -> None:
     """Best-effort self-explaining DM to Yuting when the nudge send fails."""
-    bin_ = os.environ.get("NOTIFY_DM_BIN") or str(DEFAULT_NOTIFY_DM_BIN)
+    bin_ = os.environ.get("NOTIFY_DM_BIN") or default_notify_dm_bin()
     msg = (
         "🔴 couple-review email nudge 失敗 — Chi 的傍晚 review 提醒沒寄出。\n"
         f"原因：{detail[:400]}\n"

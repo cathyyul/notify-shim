@@ -295,3 +295,17 @@ def test_ledger_failure_never_breaks_delivery(monkeypatch, routes_file, tmp_path
     results = notify_core.notify("dm", "hi", routes_path=routes_file)
 
     assert all(ok for *_, ok, _ in results)  # send succeeded despite ledger error
+
+
+def test_ledger_ts_has_microsecond_precision(monkeypatch, routes_file):
+    """Sub-second precision — two sends in the same whole second must still get
+    distinct, ordered timestamps for the strict watermark filter downstream."""
+    import re
+    run = make_run()
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    notify_core.notify("dm", "hi", routes_path=routes_file)
+
+    ts = json.loads(Path(notify_core.ledger_path()).read_text().splitlines()[0])["ts"]
+    assert re.search(r"T\d{2}:\d{2}:\d{2}\.\d{6}", ts), ts  # fractional seconds present

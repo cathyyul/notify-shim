@@ -66,6 +66,33 @@ def test_unnotified_missing_ledger_is_empty(tmp_path):
     assert nudge.unnotified(str(tmp_path / "nope.jsonl"), "group-couple", None) == []
 
 
+def test_unnotified_discriminates_within_same_second(tmp_path):
+    """Two sends in the same whole second must be separable by the watermark."""
+    ledger = write_ledger(tmp_path, [
+        entry("2026-07-27T21:00:00.050000-07:00"),   # before watermark
+        entry("2026-07-27T21:00:00.500000-07:00"),   # same second, after watermark
+    ])
+    since = nudge._parse_ts("2026-07-27T21:00:00.100000-07:00")
+    got = nudge.unnotified(ledger, "group-couple", since)
+    assert len(got) == 1  # only the .500000 entry survives, not the .050000 one
+
+
+def test_find_gog_probes_intel_path_when_which_fails(monkeypatch):
+    monkeypatch.delenv("GOG_BIN", raising=False)
+    monkeypatch.setattr(nudge.shutil, "which", lambda _n: None)
+    monkeypatch.setattr(nudge.os.path, "isfile", lambda p: p == "/usr/local/bin/gog")
+    assert nudge.find_gog() == "/usr/local/bin/gog"
+
+
+def test_alert_failure_honors_workspace_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("NOTIFY_DM_BIN", raising=False)
+    monkeypatch.setenv("OPENCLAW_WORKSPACE", str(tmp_path / "ws"))
+    calls = []
+    monkeypatch.setattr(nudge.subprocess, "run", lambda cmd, **k: calls.append(cmd))
+    nudge.alert_failure("boom")
+    assert calls and calls[0][0] == str(tmp_path / "ws" / "scripts" / "notify-dm")
+
+
 def test_unnotified_ignores_malformed_lines(tmp_path):
     p = tmp_path / "l.jsonl"
     p.write_text('not json\n'

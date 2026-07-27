@@ -58,7 +58,11 @@ def _record_ledger(route: str, results, *, dry_run: bool) -> None:
     try:
         any_ok = any(ok for (_ch, _tgt, ok, _detail) in results)
         entry = {
-            "ts": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            # Microsecond precision: the couple-group nudge watermark filters
+            # with a strict ``ts > since``, so two sends in the same whole
+            # second must still get distinct, ordered timestamps or the later
+            # one would compare equal to the watermark and be skipped forever.
+            "ts": dt.datetime.now().astimezone().isoformat(timespec="microseconds"),
             "route": route,
             "ok": any_ok,
         }
