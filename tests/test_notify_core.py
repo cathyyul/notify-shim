@@ -13,6 +13,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import notify_core  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ledger(tmp_path, monkeypatch):
+    """Point the send-ledger at a temp file so tests never touch the real one."""
+    monkeypatch.setenv("NOTIFY_LEDGER", str(tmp_path / "ledger.jsonl"))
+
+
 ROUTES = {
     "dm": {
         "description": "test dm",
@@ -235,3 +241,57 @@ def test_explicit_enabled_true_sends(monkeypatch, toggle_routes):
     rc = notify_core.main(["--route", "explicit-on", "-m", "hi", "--routes", toggle_routes])
     assert rc == 0
     assert len(run.calls) == 1
+
+
+# --- send ledger ---
+
+def test_ledger_records_successful_send(monkeypatch, routes_file, tmp_path):
+    run = make_run()
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    notify_core.notify("group-couple", "hi", routes_path=routes_file)
+
+    entries = [json.loads(l) for l in
+               Path(notify_core.ledger_path()).read_text().splitlines() if l.strip()]
+    assert len(entries) == 1
+    assert entries[0]["route"] == "group-couple"
+    assert entries[0]["ok"] is True
+    assert entries[0]["ts"][:4].isdigit()  # ISO timestamp present
+
+
+def test_ledger_records_ok_false_when_all_channels_fail(monkeypatch, routes_file):
+    run = make_run(fail_targets={"-100999", "Cdef"})  # both group channels fail
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    notify_core.notify("group-couple", "hi", routes_path=routes_file)
+
+    entries = [json.loads(l) for l in
+               Path(notify_core.ledger_path()).read_text().splitlines() if l.strip()]
+    assert entries[-1]["route"] == "group-couple"
+    assert entries[-1]["ok"] is False
+
+
+def test_ledger_skipped_on_dry_run(monkeypatch, routes_file):
+    def boom(*a, **k):  # pragma: no cover
+        raise AssertionError("subprocess.run called during dry-run")
+    monkeypatch.setattr(notify_core.subprocess, "run", boom)
+
+    notify_core.notify("dm", "hi", routes_path=routes_file, dry_run=True)
+
+    assert not Path(notify_core.ledger_path()).exists()
+
+
+def test_ledger_failure_never_breaks_delivery(monkeypatch, routes_file, tmp_path):
+    run = make_run()
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+    # Ledger parent is a *file*, so mkdir/open must fail — delivery must survive.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("NOTIFY_LEDGER", str(blocker / "ledger.jsonl"))
+
+    results = notify_core.notify("dm", "hi", routes_path=routes_file)
+
+    assert all(ok for *_, ok, _ in results)  # send succeeded despite ledger error
