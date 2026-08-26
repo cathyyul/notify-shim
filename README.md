@@ -135,6 +135,26 @@ LaunchAgents already call, so no plist changes are needed.
 | `slickdeals_deliver.sh` | `slickdeals-monitor` | `notify-dm` |
 | `weekly_offers_deliver.sh` | `weekly-standard-offers` | `notify-dm` + `notify-group-couple` |
 | `openclaw_channel_watchdog.py` | `channel-watchdog` | `notify-dm` on unhealthy channels |
+| `claude_scheduler_watchdog.py` | `claude-scheduler-watchdog` | `notify-dm` on scheduled-task spawn failures |
+
+## Claude scheduler watchdog
+
+Issue [#22](https://github.com/cathyyul/notify-shim/issues/22): when the Claude
+desktop login gets too old, spawning local scheduled-task sessions fails with
+`session_stale_relogin` and every local routine dies silently (2026-08-18/19:
+all 7 routines down for ~20h). The watchdog tails
+`~/Library/Logs/Claude/main.log` (rotation-aware, incremental via a state file)
+hourly and alerts through `notify-dm` when it sees `session_stale_relogin` or a
+`Spawning new session for scheduled task <X>` with no matching
+`Confirmed task run for: <X>` within 15 minutes. Alerts carry the cause, the fix
+(re-login to the Claude desktop app on the Mac mini), and the affected task
+list; same-cause alerts are deduped for 12h but a newly affected task re-alerts,
+and the first confirmed run after an alert sends a recovery notice.
+
+```sh
+python3 notifiers/claude_scheduler_watchdog.py --json      # check only
+python3 notifiers/claude_scheduler_watchdog.py --notify    # alert via notify-dm
+```
 
 ## OpenClaw channel watchdog
 

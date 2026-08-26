@@ -20,6 +20,15 @@
       "note": "channel-watchdog 是常駐服務（RunAtLoad）——bootstrap 讓載入變顯式且可重現。舊 deploy.sh 只 install 靠手動一次性載入＋RunAtLoad；改 bootstrap 是刻意的行為修正（S4，見 workspace-infra#15）。bootstrap 冪等：內容不變且已載入就不重載，不打斷運行中的 watchdog。"
     },
     {
+      "src": "launchagents/com.openclaw.claude-scheduler-watchdog.plist",
+      "dest": "~/Library/LaunchAgents/com.openclaw.claude-scheduler-watchdog.plist",
+      "mode": "template",
+      "vars": ["WS"],
+      "chmod": "0644",
+      "launchctl": "bootstrap",
+      "note": "每小時掃 ~/Library/Logs/Claude/main.log：session_stale_relogin／spawn 逾時未 Confirmed → notify-dm 告警（帶原因＋修法＋受影響 task 清單，12h cooldown、新 task 可再發）；恢復後發恢復通知（notify-shim#22，2026-08-18 靜默失敗 20h 事故的 watchdog）。"
+    },
+    {
       "src": "launchagents/com.openclaw.couple-review-nudge.plist",
       "dest": "~/Library/LaunchAgents/com.openclaw.couple-review-nudge.plist",
       "mode": "template",
