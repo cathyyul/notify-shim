@@ -43,6 +43,7 @@ TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 CAUSE_STALE = "session_stale_relogin"
 CAUSE_UNCONFIRMED = "unconfirmed_spawn"
+CAUSE_BLIND = "cannot_observe"
 
 
 @dataclass
@@ -50,6 +51,22 @@ class LogEvent:
     kind: str  # "spawn" | "confirm" | "cleared" | "stale"
     ts: Optional[dt.datetime]
     task: Optional[str] = None
+
+
+@dataclass
+class LogRead:
+    """What one attempt to read the log actually yielded.
+
+    ``cold`` is the single definition of "no usable cursor" in this program —
+    both the sibling bootstrap below and ``main``'s age filter read it from here
+    rather than re-deriving it, because two independent answers to that question
+    is precisely what let a run go blind while reporting healthy.
+    """
+
+    lines: "list[str]"
+    cursor: "Optional[dict[str, Any]]"  # None ⇒ nothing usable; persist nothing
+    cold: bool
+    blocked_reason: Optional[str] = None
 
 
 @dataclass
@@ -115,22 +132,26 @@ def _read_complete_lines(path: Path, start: int) -> "tuple[list[str], int]":
     return consumed.decode("utf-8", errors="replace").splitlines(), start + len(consumed)
 
 
-def read_new_lines(log_path: Path, log_state: "dict[str, Any]",
+def read_new_lines(log_path: Path, log_state: "Optional[dict[str, Any]]",
                    bootstrap_since: Optional[dt.datetime] = None,
-                   ) -> "tuple[list[str], dict[str, Any]]":
-    stored_ino = log_state.get("inode")
-    stored_off = log_state.get("offset", 0)
+                   ) -> LogRead:
+    stored_ino = (log_state or {}).get("inode")
+    stored_off = (log_state or {}).get("offset", 0)
+    cold = stored_ino is None
     lines: "list[str]" = []
     try:
         st = log_path.stat()
-    except FileNotFoundError:
-        return [], {"inode": None, "offset": 0}
+    except OSError as exc:
+        # We observed nothing at all. Return no cursor: absence has to stay
+        # absence, because a placeholder cursor reads as a warm resume on the
+        # next run and quietly disables the bootstrap below.
+        return LogRead([], None, cold, f"無法讀取 {log_path}：{exc}")
 
-    if stored_ino == st.st_ino and stored_off <= st.st_size:
+    if not cold and stored_ino == st.st_ino and stored_off <= st.st_size:
         start = stored_off
     else:
         start = 0
-        if stored_ino is not None:
+        if not cold:
             # The previous main.log was rotated away; find it by inode among
             # the rotated siblings (main1.log, main2.log, ...) and drain its tail.
             pattern = f"{log_path.stem}[0-9]*{log_path.suffix}"
@@ -164,36 +185,69 @@ def read_new_lines(log_path: Path, log_state: "dict[str, Any]",
 
     new_lines, new_off = _read_complete_lines(log_path, start)
     lines.extend(new_lines)
-    return lines, {"inode": st.st_ino, "offset": new_off}
+    return LogRead(lines, {"inode": st.st_ino, "offset": new_off}, cold)
+
+
+def _consume_pending(pending: "list[dict[str, Any]]", task: Optional[str],
+                     ts: Optional[dt.datetime],
+                     ) -> "tuple[list[dict[str, Any]], Optional[dict[str, Any]]]":
+    """Resolve exactly one outstanding spawn of ``task`` — the one this event followed.
+
+    The log carries no invocation id, so the pairing is inferred from order: a
+    ``Confirmed task run`` normally lands a second or two after the spawn it
+    belongs to, which makes the newest spawn at or before the event the match.
+    Dropping every row for the task instead (the original behaviour) let one
+    healthy rerun erase an earlier invocation that really was missed.
+    """
+    matches = [i for i, p in enumerate(pending) if p["task"] == task]
+    if not matches:
+        return pending, None
+    eligible = [i for i in matches
+                if ts is None or (parse_ts(pending[i].get("ts")) or ts) <= ts]
+    idx = (eligible or matches)[-1]
+    return pending[:idx] + pending[idx + 1:], pending[idx]
 
 
 def format_alert(incident: "dict[str, Any]") -> str:
+    causes = incident.get("causes", [])
     lines = ["⚠️ Claude 排程 watchdog：本機 scheduled-task 排程異常"]
-    if CAUSE_STALE in incident.get("causes", []):
+    if CAUSE_BLIND in causes:
+        lines.append(
+            "原因：watchdog 讀不到排程日誌，這段期間無法判斷排程是否正常"
+            f"——{incident.get('blind_reason')}")
+        lines.append(
+            "修法：確認 ~/Library/Logs/Claude/main.log 存在且可讀；"
+            "Claude desktop app 沒在跑就不會產生日誌。")
+    if CAUSE_STALE in causes:
         lines.append(
             "原因：Claude desktop app 登入過期（session_stale_relogin），"
             "排程 session 無法取得 elevated scope，spawn 全部失敗。")
         lines.append(
             "修法：在 Mac mini 上重新登入 Claude desktop app；"
             "登入後排程會自動恢復（watchdog 會另發恢復通知）。")
-    else:
+    elif CAUSE_UNCONFIRMED in causes:
         lines.append("原因：scheduled task spawn 後逾時未見 Confirmed task run（原因未知）。")
         lines.append("修法：查 ~/Library/Logs/Claude/main.log 的 [CCDScheduledTasks] 段。")
     tasks = incident.get("affected_tasks", [])
     if tasks:
         lines.append("受影響 tasks：" + ", ".join(tasks))
-    else:
+    elif causes != [CAUSE_BLIND]:
+        # With nothing observable there is no task list to speak of, so only say
+        # this when we actually looked.
         lines.append("受影響 tasks：（尚未觀察到具體 task，僅見 oauth 失敗）")
     if incident.get("first_seen_at"):
         lines.append(f"事故起始：{incident['first_seen_at']}")
     return "\n".join(lines)
 
 
-def format_recovery(incident: "dict[str, Any]", confirm: LogEvent) -> str:
-    lines = [
-        "✅ Claude 排程已恢復：偵測到 Confirmed task run for: "
-        f"{confirm.task}（{fmt_ts(confirm.ts) or '時間不明'}）。"
-    ]
+def format_recovery(incident: "dict[str, Any]", resolver: "dict[str, Any]") -> str:
+    when = resolver.get("ts") or "時間不明"
+    if resolver.get("kind") == "observation":
+        head = f"✅ Claude 排程 watchdog 已恢復觀測：重新讀到排程日誌（{when}）。"
+    else:
+        head = ("✅ Claude 排程已恢復：偵測到 Confirmed task run for: "
+                f"{resolver.get('task')}（{when}）。")
+    lines = [head]
     tasks = incident.get("affected_tasks", [])
     if tasks:
         lines.append("事故期間受影響 tasks：" + ", ".join(tasks))
@@ -202,11 +256,16 @@ def format_recovery(incident: "dict[str, Any]", confirm: LogEvent) -> str:
 
 def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime,
              pending_timeout_min: int = 15,
-             cooldown_hours: int = 12) -> EvalResult:
+             cooldown_hours: int = 12,
+             blocked_reason: Optional[str] = None) -> EvalResult:
     """Pure incident logic; mutates ``state`` in place.
 
     Deciding to alert is *not* recording that one was sent — the cooldown is
     only consumed once ``notify-dm`` confirms delivery, via ``mark_alerted``.
+
+    ``blocked_reason`` says this run could not read the log at all. That is an
+    incident cause in its own right, not a quiet healthy result: a watchdog that
+    cannot see is the exact failure mode this tool exists to catch.
     """
     pending: "list[dict[str, Any]]" = list(state.get("pending_spawns", []))
     incident: "Optional[dict[str, Any]]" = state.get("active_incident")
@@ -233,13 +292,14 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
         if ev.kind == "spawn":
             pending.append({"task": ev.task, "ts": fmt_ts(ev.ts)})
         elif ev.kind == "confirm":
-            pending = [p for p in pending if p["task"] != ev.task]
+            pending, _ = _consume_pending(pending, ev.task, ev.ts)
             if ev.ts is not None and (ev.task not in confirms or ev.ts > confirms[ev.task]):
                 confirms[ev.task] = ev.ts
             last_confirm = ev
         elif ev.kind == "cleared":
-            pending = [p for p in pending if p["task"] != ev.task]
-            note_failure(ev.task, ev.ts)
+            pending, consumed = _consume_pending(pending, ev.task, ev.ts)
+            spawned_at = parse_ts((consumed or {}).get("ts"))
+            note_failure(ev.task, spawned_at or ev.ts)
         elif ev.kind == "stale":
             stale_seen = True
             if ev.ts is not None and (window_stale_at is None or ev.ts > window_stale_at):
@@ -293,12 +353,20 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
             open_failures = {task: ts for task, ts in open_failures.items()
                              if ts is not None and ts > stale_at}
 
-    if not open_failures and not stale_open:
+    # Being unable to look is a cause, not a clean bill of health. It reflects
+    # this run only: if we could read the log, we are no longer blind.
+    blind_open = blocked_reason is not None
+
+    if not open_failures and not stale_open and not blind_open:
         if incident is None:
             return EvalResult(None, None, incident_active=False)
         resolver = incident.get("resolved_by")
         if last_confirm is not None and last_confirm.ts is not None:
-            resolver = {"task": last_confirm.task, "ts": fmt_ts(last_confirm.ts)}
+            resolver = {"kind": "confirm", "task": last_confirm.task,
+                        "ts": fmt_ts(last_confirm.ts)}
+        elif resolver is None and CAUSE_BLIND in incident.get("causes", []):
+            # Sight returning is itself the evidence — no confirm required.
+            resolver = {"kind": "observation", "ts": fmt_ts(now)}
         if not incident.get("last_alert_at") or resolver is None:
             # Nothing was ever paged, so no notice is owed and the incident can
             # simply close.
@@ -311,9 +379,7 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
         incident["open_failures"] = {}
         incident["stale_open"] = False
         state["active_incident"] = incident
-        resolving_confirm = LogEvent("confirm", parse_ts(resolver.get("ts")),
-                                     resolver.get("task"))
-        return EvalResult(None, format_recovery(incident, resolving_confirm),
+        return EvalResult(None, format_recovery(incident, resolver),
                           incident_active=False)
 
     if incident is None:
@@ -330,7 +396,10 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
         causes.add(CAUSE_STALE)
     if open_failures:
         causes.add(CAUSE_UNCONFIRMED)
+    if blind_open:
+        causes.add(CAUSE_BLIND)
     incident["causes"] = sorted(causes)
+    incident["blind_reason"] = blocked_reason
     incident["affected_tasks"] = sorted(
         set(incident.get("affected_tasks", [])) | set(open_failures))
     incident["open_failures"] = {task: fmt_ts(ts) for task, ts in open_failures.items()}
@@ -457,19 +526,18 @@ def main() -> int:
     try:
         now = dt.datetime.now()
         state = load_json(args.state_file)
-        cold_start = not state.get("log")
         bootstrap_since = now - dt.timedelta(hours=args.bootstrap_window_hours)
-        lines, log_state = read_new_lines(
-            args.log_file, state.get("log", {}),
-            bootstrap_since=bootstrap_since if cold_start else None)
-        events = parse_events(lines)
-        if cold_start:
+        read = read_new_lines(args.log_file, state.get("log"),
+                              bootstrap_since=bootstrap_since)
+        events = parse_events(read.lines)
+        if read.cold:
             # A cold start reads whole files, so bound it by age: report what is
             # happening now, not an incident that was resolved months ago.
             events = [ev for ev in events if ev.ts is None or ev.ts >= bootstrap_since]
         result = evaluate(state, events, now,
                           pending_timeout_min=args.pending_timeout_min,
-                          cooldown_hours=args.cooldown_hours)
+                          cooldown_hours=args.cooldown_hours,
+                          blocked_reason=read.blocked_reason)
 
         notified = False
         if args.notify:
@@ -484,14 +552,20 @@ def main() -> int:
                     mark_recovered(state)
                     notified = True
 
-        state["log"] = log_state
+        if read.cursor is not None:
+            # Only advance the cursor when we actually read something. A run that
+            # saw nothing leaves the previous cursor alone rather than replacing
+            # it with a placeholder that the next run would mistake for a resume.
+            state["log"] = read.cursor
         state["checked_at"] = now.strftime(TS_FORMAT)
         state["last_result"] = {
             "ok": not result.incident_active,
-            "scanned_lines": len(lines),
+            "scanned_lines": len(read.lines),
             "events": len(events),
             "notified": notified,
         }
+        if read.blocked_reason:
+            state["last_result"]["blocked"] = read.blocked_reason
         save_json(args.state_file, state)
 
         payload = dict(state["last_result"])

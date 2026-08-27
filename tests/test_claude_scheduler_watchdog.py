@@ -223,31 +223,32 @@ class TestReadNewLines:
     def test_incremental_read_only_new_complete_lines(self, tmp_path):
         log = tmp_path / "main.log"
         log.write_text("line1\nline2\n", encoding="utf-8")
-        lines, st = mod.read_new_lines(log, {})
-        assert lines == ["line1", "line2"]
+        read = mod.read_new_lines(log, {})
+        assert read.lines == ["line1", "line2"]
         log.write_text("line1\nline2\nline3\npartial", encoding="utf-8")
-        lines, st = mod.read_new_lines(log, st)
-        assert lines == ["line3"]
+        read = mod.read_new_lines(log, read.cursor)
+        assert read.lines == ["line3"]
         # partial line is not consumed until its newline arrives
         log.write_text("line1\nline2\nline3\npartial done\n", encoding="utf-8")
-        lines, st = mod.read_new_lines(log, st)
-        assert lines == ["partial done"]
+        read = mod.read_new_lines(log, read.cursor)
+        assert read.lines == ["partial done"]
 
     def test_rotation_reads_tail_of_rotated_then_new_file(self, tmp_path):
         log = tmp_path / "main.log"
         log.write_text("old1\n", encoding="utf-8")
-        _, st = mod.read_new_lines(log, {})
+        first = mod.read_new_lines(log, {})
         # rotate: main.log → main1.log, new main.log appears
         with log.open("a", encoding="utf-8") as f:
             f.write("old2\n")
         log.rename(tmp_path / "main1.log")
         log.write_text("new1\n", encoding="utf-8")
-        lines, st = mod.read_new_lines(log, st)
-        assert lines == ["old2", "new1"]
+        read = mod.read_new_lines(log, first.cursor)
+        assert read.lines == ["old2", "new1"]
 
-    def test_missing_log_file_is_not_an_error(self, tmp_path):
-        lines, st = mod.read_new_lines(tmp_path / "main.log", {})
-        assert lines == []
+    def test_missing_log_file_is_reported_as_unobservable(self, tmp_path):
+        read = mod.read_new_lines(tmp_path / "main.log", {})
+        assert read.lines == []
+        assert read.blocked_reason is not None
 
 
 class TestAlertDeliveryGating:
@@ -583,9 +584,10 @@ class TestColdStartBootstrap:
         (tmp_path / "main1.log").write_text("rotated line\n", encoding="utf-8")
         main = tmp_path / "main.log"
         main.write_text("current line\n", encoding="utf-8")
-        lines, _ = mod.read_new_lines(
+        read = mod.read_new_lines(
             main, {}, bootstrap_since=dt.datetime.now() - dt.timedelta(hours=24))
-        assert lines == ["rotated line", "current line"]
+        assert read.lines == ["rotated line", "current line"]
+        assert read.cold is True
 
     def test_cold_start_skips_siblings_older_than_the_window(self, tmp_path):
         rotated = tmp_path / "main1.log"
@@ -594,20 +596,21 @@ class TestColdStartBootstrap:
         os.utime(rotated, (old, old))
         main = tmp_path / "main.log"
         main.write_text("current line\n", encoding="utf-8")
-        lines, _ = mod.read_new_lines(
+        read = mod.read_new_lines(
             main, {}, bootstrap_since=dt.datetime.now() - dt.timedelta(hours=24))
-        assert lines == ["current line"]
+        assert read.lines == ["current line"]
 
     def test_warm_start_does_not_re_read_siblings(self, tmp_path):
         main = tmp_path / "main.log"
         main.write_text("first\n", encoding="utf-8")
-        _, st = mod.read_new_lines(main, {})
+        first = mod.read_new_lines(main, {})
         (tmp_path / "main1.log").write_text("rotated line\n", encoding="utf-8")
         with main.open("a", encoding="utf-8") as f:
             f.write("second\n")
-        lines, _ = mod.read_new_lines(
-            main, st, bootstrap_since=dt.datetime.now() - dt.timedelta(hours=24))
-        assert lines == ["second"]
+        read = mod.read_new_lines(
+            main, first.cursor, bootstrap_since=dt.datetime.now() - dt.timedelta(hours=24))
+        assert read.lines == ["second"]
+        assert read.cold is False
 
     def test_main_sees_an_incident_whose_evidence_already_rotated(self, tmp_path, monkeypatch):
         (tmp_path / "main1.log").write_text("\n".join([
@@ -646,6 +649,167 @@ class TestColdStartBootstrap:
         ])
         assert mod.main() == 0
         assert sent == []
+
+
+class TestCannotObserve:
+    """"I could not look" must never be reported as "I looked and all is well".
+
+    Round-4 handoff (Yuting approved the redesign 2026-08-27): three of the four
+    rounds' true bugs were variants of the watchdog going blind while reporting
+    healthy. Being unable to observe is now an incident cause of its own.
+    """
+
+    def test_missing_log_is_an_incident_not_a_clean_bill(self, tmp_path):
+        state = {}
+        result = mod.evaluate(state, [], now=T("2026-08-22 09:00:00"),
+                              blocked_reason="無法讀取 main.log")
+        assert result.incident_active is True
+        assert result.alert_message is not None
+        assert "無法讀取 main.log" in result.alert_message
+        assert mod.CAUSE_BLIND in state["active_incident"]["causes"]
+
+    def test_blind_alert_respects_its_cooldown(self):
+        state = {}
+        mod.evaluate(state, [], now=T("2026-08-22 09:00:00"), blocked_reason="boom")
+        mod.mark_alerted(state, T("2026-08-22 09:00:00"))
+        again = mod.evaluate(state, [], now=T("2026-08-22 10:00:00"), blocked_reason="boom")
+        assert again.alert_message is None
+        assert again.incident_active is True
+
+    def test_regaining_sight_resolves_the_blind_incident(self):
+        state = {}
+        mod.evaluate(state, [], now=T("2026-08-22 09:00:00"), blocked_reason="boom")
+        mod.mark_alerted(state, T("2026-08-22 09:00:00"))
+        result = mod.evaluate(state, [], now=T("2026-08-22 10:00:00"))
+        assert result.incident_active is False
+        assert result.recovery_message is not None
+        mod.mark_recovered(state)
+        assert state.get("active_incident") is None
+
+    def test_blindness_does_not_bury_a_real_failure(self):
+        state = {}
+        mod.evaluate(state, mod.parse_events([SPAWN_A]), now=T("2026-08-22 09:01:00"))
+        mod.evaluate(state, [], now=T("2026-08-22 09:20:00"))
+        mod.mark_alerted(state, T("2026-08-22 09:20:00"))
+        # the log vanishes; regaining sight must not clear the task failure
+        mod.evaluate(state, [], now=T("2026-08-22 09:30:00"), blocked_reason="boom")
+        result = mod.evaluate(state, [], now=T("2026-08-22 09:40:00"))
+        assert result.incident_active is True
+        assert result.recovery_message is None
+        assert "meal-plan-cart" in state["active_incident"]["affected_tasks"]
+
+    def test_main_reports_an_unreadable_log_as_an_incident(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "state.json"
+        sent = []
+        monkeypatch.setattr(mod, "send_notification",
+                            lambda message, _bin: (sent.append(message), True)[1])
+        monkeypatch.setattr(sys, "argv", [
+            "claude_scheduler_watchdog.py",
+            "--log-file", str(tmp_path / "absent" / "main.log"),
+            "--state-file", str(state_file), "--notify",
+        ])
+        assert mod.main() == 1
+        assert len(sent) == 1
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        assert state["last_result"]["ok"] is False
+
+
+class TestCursorIsNeverASentinel:
+    """A run that observed nothing must not leave a cursor that looks warm.
+
+    Round-4 review [high], reproduced before the fix: a missing-log run stored
+    ``{"inode": None, "offset": 0}``, which is truthy, so the next run took the
+    warm path and skipped both the rotated-sibling bootstrap and the age filter.
+    """
+
+    @staticmethod
+    def _recent(mins_ago, body):
+        stamp = dt.datetime.now() - dt.timedelta(minutes=mins_ago)
+        return f"{stamp.strftime('%Y-%m-%d %H:%M:%S')} {body}"
+
+    def test_unreadable_log_persists_no_cursor(self, tmp_path):
+        read = mod.read_new_lines(tmp_path / "absent.log", {})
+        assert read.cursor is None
+        assert read.blocked_reason is not None
+        assert read.cold is True
+
+    def test_missing_log_run_leaves_state_still_cold(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr(mod, "send_notification", lambda *a, **k: True)
+        monkeypatch.setattr(sys, "argv", [
+            "claude_scheduler_watchdog.py",
+            "--log-file", str(tmp_path / "main.log"),
+            "--state-file", str(state_file), "--notify",
+        ])
+        mod.main()
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        assert not state.get("log", {}).get("inode")
+
+        # the log reappears, with the decisive evidence already rotated out
+        (tmp_path / "main1.log").write_text("\n".join([
+            self._recent(120, "[info] [CCDScheduledTasks] Spawning new session for "
+                              "scheduled task process-replies { cronExpression: '0 12 * * *' }"),
+            self._recent(119, "[error] Cannot start session local_abc: Unable to start "
+                              "session. Sign in again to continue: session_stale_relogin"),
+        ]) + "\n", encoding="utf-8")
+        (tmp_path / "main.log").write_text(
+            self._recent(60, "[info] [process-memory] trigger=interval tree_rss_sum=369MB") + "\n",
+            encoding="utf-8")
+
+        sent = []
+        monkeypatch.setattr(mod, "send_notification",
+                            lambda message, _bin: (sent.append(message), True)[1])
+        assert mod.main() == 1
+        assert any("session_stale_relogin" in message for message in sent)
+
+    def test_read_reports_cold_from_the_cursor_alone(self, tmp_path):
+        log = tmp_path / "main.log"
+        log.write_text("first\n", encoding="utf-8")
+        first = mod.read_new_lines(log, {})
+        assert first.cold is True
+        second = mod.read_new_lines(log, first.cursor)
+        assert second.cold is False
+
+
+class TestPendingSpawnGranularity:
+    """One confirm resolves one spawn, not every pending row for that task.
+
+    Raised by the reviewer in rounds 3 and 4; folded into the approved redesign.
+    """
+
+    SPAWN_0900 = ("2026-08-22 09:00:00 [info] [CCDScheduledTasks] Spawning new session "
+                  "for scheduled task process-replies { cronExpression: '0 9 * * *' }")
+    SPAWN_0910 = ("2026-08-22 09:10:00 [info] [CCDScheduledTasks] Spawning new session "
+                  "for scheduled task process-replies { cronExpression: '0 9 * * *' }")
+    CONFIRM_0912 = ("2026-08-22 09:12:00 [info] [CCDScheduledTasks] "
+                    "Confirmed task run for: process-replies")
+
+    def test_one_confirm_leaves_the_earlier_spawn_outstanding(self):
+        state = {}
+        mod.evaluate(state, mod.parse_events(
+            [self.SPAWN_0900, self.SPAWN_0910, self.CONFIRM_0912]),
+            now=T("2026-08-22 09:13:00"))
+        assert [p["ts"] for p in state["pending_spawns"]] == ["2026-08-22 09:00:00"]
+
+    def test_the_missed_run_still_alerts(self):
+        state = {}
+        mod.evaluate(state, mod.parse_events(
+            [self.SPAWN_0900, self.SPAWN_0910, self.CONFIRM_0912]),
+            now=T("2026-08-22 09:13:00"))
+        result = mod.evaluate(state, [], now=T("2026-08-22 09:30:00"))
+        assert result.alert_message is not None
+        assert "process-replies" in result.alert_message
+
+    def test_a_confirm_pairs_with_the_spawn_it_followed(self):
+        # both spawns confirmed: nothing outstanding, nothing to alert about
+        second_confirm = ("2026-08-22 09:14:00 [info] [CCDScheduledTasks] "
+                          "Confirmed task run for: process-replies")
+        state = {}
+        result = mod.evaluate(state, mod.parse_events(
+            [self.SPAWN_0900, self.SPAWN_0910, self.CONFIRM_0912, second_confirm]),
+            now=T("2026-08-22 09:30:00"))
+        assert state["pending_spawns"] == []
+        assert result.alert_message is None
 
 
 class TestFormatting:
