@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -80,7 +82,7 @@ class TestEvaluate:
     def test_normal_day_no_incident_no_alert(self):
         state = {}
         result = mod.evaluate(state, mod.parse_events([NORMAL_SPAWN, NORMAL_CONFIRM]),
-                              now=T("2026-08-20 13:00:00"), will_notify=True)
+                              now=T("2026-08-20 13:00:00"))
         assert result.alert_message is None
         assert result.recovery_message is None
         assert state.get("active_incident") is None
@@ -89,11 +91,12 @@ class TestEvaluate:
     def test_stale_relogin_alerts_on_next_hourly_run(self):
         state = {}
         events = mod.parse_events([SPAWN_LINE] + STALE_LINES)
-        result = mod.evaluate(state, events, now=T("2026-08-18 13:00:00"), will_notify=True)
+        result = mod.evaluate(state, events, now=T("2026-08-18 13:00:00"))
         assert result.alert_message is not None
         assert "session_stale_relogin" in result.alert_message
         assert "重新登入" in result.alert_message           # 修法
         assert "process-replies" in result.alert_message    # affected task
+        mod.mark_alerted(state, T("2026-08-18 13:00:00"))   # notify-dm accepted it
         incident = state["active_incident"]
         assert incident["last_alert_at"] is not None
         assert incident["affected_tasks"] == ["process-replies"]
@@ -104,19 +107,21 @@ class TestEvaluate:
     def test_cooldown_suppresses_repeat_alert_same_tasks(self):
         state = {}
         mod.evaluate(state, mod.parse_events([SPAWN_LINE] + STALE_LINES),
-                     now=T("2026-08-18 13:00:00"), will_notify=True)
+                     now=T("2026-08-18 13:00:00"))
+        mod.mark_alerted(state, T("2026-08-18 13:00:00"))
         # next hourly run: more stale noise, same task set
         result = mod.evaluate(state, mod.parse_events([CLEARED_LINE, STALE_LINES[2]]),
-                              now=T("2026-08-18 14:00:00"), will_notify=True)
+                              now=T("2026-08-18 14:00:00"))
         assert result.alert_message is None
         assert state["active_incident"] is not None
 
     def test_new_affected_task_realerts_within_cooldown(self):
         state = {}
         mod.evaluate(state, mod.parse_events([SPAWN_LINE] + STALE_LINES),
-                     now=T("2026-08-18 13:00:00"), will_notify=True)
+                     now=T("2026-08-18 13:00:00"))
+        mod.mark_alerted(state, T("2026-08-18 13:00:00"))
         result = mod.evaluate(state, mod.parse_events([CLEARED_LINE_2]),
-                              now=T("2026-08-18 23:59:00"), will_notify=True)
+                              now=T("2026-08-18 23:59:00"))
         assert result.alert_message is not None
         assert "daily-memory-sync" in result.alert_message
         assert state["active_incident"]["affected_tasks"] == [
@@ -125,19 +130,21 @@ class TestEvaluate:
     def test_cooldown_elapsed_realerts_same_tasks(self):
         state = {}
         mod.evaluate(state, mod.parse_events([SPAWN_LINE] + STALE_LINES),
-                     now=T("2026-08-18 13:00:00"), will_notify=True)
+                     now=T("2026-08-18 13:00:00"))
+        mod.mark_alerted(state, T("2026-08-18 13:00:00"))
         result = mod.evaluate(state, mod.parse_events([STALE_LINES[2]]),
-                              now=T("2026-08-19 01:30:00"), will_notify=True)  # > 12h later
+                              now=T("2026-08-19 01:30:00"))  # > 12h later
         assert result.alert_message is not None
 
     def test_recovery_notice_after_confirm(self):
         state = {}
         mod.evaluate(state, mod.parse_events([SPAWN_LINE] + STALE_LINES),
-                     now=T("2026-08-18 13:00:00"), will_notify=True)
+                     now=T("2026-08-18 13:00:00"))
+        mod.mark_alerted(state, T("2026-08-18 13:00:00"))
         recover_line = ("2026-08-19 08:03:12 [info] [CCDScheduledTasks] "
                         "Confirmed task run for: daily-memory-sync")
         result = mod.evaluate(state, mod.parse_events([recover_line]),
-                              now=T("2026-08-19 09:00:00"), will_notify=True)
+                              now=T("2026-08-19 09:00:00"))
         assert result.alert_message is None
         assert result.recovery_message is not None
         assert "恢復" in result.recovery_message
@@ -145,12 +152,12 @@ class TestEvaluate:
 
     def test_no_recovery_notice_if_never_alerted(self):
         state = {}
-        # incident detected but notify disabled → no alert was ever sent
+        # incident detected but nothing was ever delivered (no mark_alerted)
         mod.evaluate(state, mod.parse_events(STALE_LINES),
-                     now=T("2026-08-18 13:00:00"), will_notify=False)
+                     now=T("2026-08-18 13:00:00"))
         assert state["active_incident"]["last_alert_at"] is None
         result = mod.evaluate(state, mod.parse_events([NORMAL_CONFIRM]),
-                              now=T("2026-08-20 13:00:00"), will_notify=False)
+                              now=T("2026-08-20 13:00:00"))
         assert result.recovery_message is None
         assert state.get("active_incident") is None
 
@@ -159,22 +166,22 @@ class TestEvaluate:
         recover_line = ("2026-08-18 12:45:00 [info] [CCDScheduledTasks] "
                         "Confirmed task run for: process-replies")
         result = mod.evaluate(state, mod.parse_events([SPAWN_LINE] + STALE_LINES + [recover_line]),
-                              now=T("2026-08-18 13:00:00"), will_notify=True)
+                              now=T("2026-08-18 13:00:00"))
         assert result.alert_message is None
         assert state.get("active_incident") is None
 
     def test_spawn_within_timeout_stays_pending_no_alert(self):
         state = {}
         result = mod.evaluate(state, mod.parse_events([NORMAL_SPAWN]),
-                              now=T("2026-08-20 12:07:00"), will_notify=True)
+                              now=T("2026-08-20 12:07:00"))
         assert result.alert_message is None
         assert [p["task"] for p in state["pending_spawns"]] == ["process-replies"]
 
     def test_unconfirmed_spawn_past_timeout_alerts(self):
         state = {}
         mod.evaluate(state, mod.parse_events([NORMAL_SPAWN]),
-                     now=T("2026-08-20 12:07:00"), will_notify=True)
-        result = mod.evaluate(state, [], now=T("2026-08-20 13:00:00"), will_notify=True)
+                     now=T("2026-08-20 12:07:00"))
+        result = mod.evaluate(state, [], now=T("2026-08-20 13:00:00"))
         assert result.alert_message is not None
         assert "process-replies" in result.alert_message
         assert "main.log" in result.alert_message           # 修法 pointer for unknown cause
@@ -183,9 +190,9 @@ class TestEvaluate:
     def test_pending_confirmed_next_window_is_cleared(self):
         state = {}
         mod.evaluate(state, mod.parse_events([NORMAL_SPAWN]),
-                     now=T("2026-08-20 12:07:00"), will_notify=True)
+                     now=T("2026-08-20 12:07:00"))
         result = mod.evaluate(state, mod.parse_events([NORMAL_CONFIRM]),
-                              now=T("2026-08-20 12:08:00"), will_notify=True)
+                              now=T("2026-08-20 12:08:00"))
         assert result.alert_message is None
         assert state["pending_spawns"] == []
 
@@ -219,6 +226,104 @@ class TestReadNewLines:
     def test_missing_log_file_is_not_an_error(self, tmp_path):
         lines, st = mod.read_new_lines(tmp_path / "main.log", {})
         assert lines == []
+
+
+class TestAlertDeliveryGating:
+    """A page that never reached Yuting must not count against the cooldown.
+
+    Round-1 review P1: ``evaluate`` used to stamp ``last_alert_at`` as soon as
+    it decided to alert, so a missing/failing ``notify-dm`` silently bought the
+    incident 12h of suppression — the exact silence this watchdog exists to break.
+    """
+
+    def _detect(self, state, now="2026-08-18 13:00:00"):
+        return mod.evaluate(state, mod.parse_events([SPAWN_LINE] + STALE_LINES), now=T(now))
+
+    def test_evaluate_does_not_record_delivery_itself(self):
+        state = {}
+        assert self._detect(state).alert_message is not None
+        assert state["active_incident"]["last_alert_at"] is None
+        assert state["active_incident"]["alerted_tasks"] == []
+
+    def test_undelivered_alert_is_retried_next_run(self):
+        state = {}
+        assert self._detect(state).alert_message is not None
+        # delivery failed → main() never calls mark_alerted()
+        result = mod.evaluate(state, mod.parse_events([STALE_LINES[2]]),
+                              now=T("2026-08-18 14:00:00"))
+        assert result.alert_message is not None
+
+    def test_delivered_alert_suppresses_next_run(self):
+        state = {}
+        assert self._detect(state).alert_message is not None
+        mod.mark_alerted(state, T("2026-08-18 13:00:00"))
+        assert state["active_incident"]["alerted_tasks"] == ["process-replies"]
+        result = mod.evaluate(state, mod.parse_events([STALE_LINES[2]]),
+                              now=T("2026-08-18 14:00:00"))
+        assert result.alert_message is None
+
+    def test_mark_alerted_without_incident_is_a_noop(self):
+        state = {}
+        mod.mark_alerted(state, T("2026-08-18 13:00:00"))
+        assert state == {}
+
+
+class TestSendNotification:
+    def test_missing_shim_reports_failure(self, tmp_path):
+        assert mod.send_notification("hi", tmp_path / "absent") is False
+
+    def test_nonzero_exit_reports_failure(self, tmp_path, monkeypatch):
+        shim = tmp_path / "notify-dm"
+        shim.write_text("", encoding="utf-8")
+        monkeypatch.setattr(mod.subprocess, "run",
+                            lambda *a, **k: subprocess.CompletedProcess(a[0], 1, "", "boom"))
+        assert mod.send_notification("hi", shim) is False
+
+    def test_raised_exception_reports_failure(self, tmp_path, monkeypatch):
+        shim = tmp_path / "notify-dm"
+        shim.write_text("", encoding="utf-8")
+
+        def blow_up(*a, **k):
+            raise OSError("no exec")
+
+        monkeypatch.setattr(mod.subprocess, "run", blow_up)
+        assert mod.send_notification("hi", shim) is False
+
+    def test_successful_send_reports_success(self, tmp_path, monkeypatch):
+        shim = tmp_path / "notify-dm"
+        shim.write_text("", encoding="utf-8")
+        monkeypatch.setattr(mod.subprocess, "run",
+                            lambda *a, **k: subprocess.CompletedProcess(a[0], 0, "", ""))
+        assert mod.send_notification("hi", shim) is True
+
+
+class TestMainDeliveryGating:
+    """End-to-end: the persisted state must reflect delivery, not intent."""
+
+    def _run(self, tmp_path, monkeypatch, delivered):
+        log = tmp_path / "main.log"
+        log.write_text("\n".join([SPAWN_LINE] + STALE_LINES) + "\n", encoding="utf-8")
+        state_file = tmp_path / "state.json"
+        monkeypatch.setattr(mod, "send_notification", lambda *a, **k: delivered)
+        monkeypatch.setattr(sys, "argv", [
+            "claude_scheduler_watchdog.py",
+            "--log-file", str(log), "--state-file", str(state_file), "--notify",
+        ])
+        rc = mod.main()
+        return rc, json.loads(state_file.read_text(encoding="utf-8"))
+
+    def test_failed_delivery_leaves_incident_unalerted(self, tmp_path, monkeypatch):
+        rc, state = self._run(tmp_path, monkeypatch, delivered=False)
+        assert rc == 1
+        assert state["active_incident"]["last_alert_at"] is None
+        assert state["last_result"]["notified"] is False
+
+    def test_successful_delivery_records_the_alert(self, tmp_path, monkeypatch):
+        rc, state = self._run(tmp_path, monkeypatch, delivered=True)
+        assert rc == 1
+        assert state["active_incident"]["last_alert_at"] is not None
+        assert state["active_incident"]["alerted_tasks"] == ["process-replies"]
+        assert state["last_result"]["notified"] is True
 
 
 class TestFormatting:

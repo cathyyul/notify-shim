@@ -181,9 +181,13 @@ def format_recovery(incident: "dict[str, Any]", confirm: LogEvent) -> str:
 
 
 def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime,
-             will_notify: bool, pending_timeout_min: int = 15,
+             pending_timeout_min: int = 15,
              cooldown_hours: int = 12) -> EvalResult:
-    """Pure incident logic; mutates ``state`` in place."""
+    """Pure incident logic; mutates ``state`` in place.
+
+    Deciding to alert is *not* recording that one was sent — the cooldown is
+    only consumed once ``notify-dm`` confirms delivery, via ``mark_alerted``.
+    """
     pending: "list[dict[str, Any]]" = list(state.get("pending_spawns", []))
     incident: "Optional[dict[str, Any]]" = state.get("active_incident")
 
@@ -281,10 +285,22 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
                      or (now - last_alert) >= dt.timedelta(hours=cooldown_hours))
     if cooldown_over or new_tasks:
         alert_message = format_alert(incident)
-        if will_notify:
-            incident["last_alert_at"] = fmt_ts(now)
-            incident["alerted_tasks"] = incident["affected_tasks"]
     return EvalResult(alert_message, None, incident_active=True)
+
+
+def mark_alerted(state: "dict[str, Any]", now: dt.datetime) -> None:
+    """Record that an alert actually reached Yuting.
+
+    Only called after ``notify-dm`` reports success. An alert that failed to
+    send must not consume the cooldown — otherwise a missing or broken shim
+    buys a live incident 12 more hours of the silence this watchdog exists to
+    break.
+    """
+    incident = state.get("active_incident")
+    if incident is None:
+        return
+    incident["last_alert_at"] = fmt_ts(now)
+    incident["alerted_tasks"] = incident["affected_tasks"]
 
 
 def load_json(path: Path) -> "dict[str, Any]":
@@ -301,19 +317,23 @@ def save_json(path: Path, payload: "dict[str, Any]") -> None:
         f.write("\n")
 
 
-def send_notification(message: str, notify_bin: Path) -> None:
+def send_notification(message: str, notify_bin: Path) -> bool:
+    """Send via the notify-dm shim. Returns True only when it was accepted."""
     try:
         if not notify_bin.exists():
             print(f"notify: shim not found at {notify_bin}", file=sys.stderr)
-            return
+            return False
         proc = subprocess.run([str(notify_bin), message], timeout=30,
                               capture_output=True, text=True)
         if proc.returncode != 0:
             detail = (proc.stdout + proc.stderr).strip()
             print(f"notify: notify-dm exited {proc.returncode}: {detail}",
                   file=sys.stderr)
+            return False
+        return True
     except Exception as exc:
         print(f"notify: failed to invoke notify-dm: {exc}", file=sys.stderr)
+        return False
 
 
 def main() -> int:
@@ -341,18 +361,21 @@ def main() -> int:
         lines, log_state = read_new_lines(args.log_file, state.get("log", {}))
         events = parse_events(lines)
         now = dt.datetime.now()
-        result = evaluate(state, events, now, will_notify=args.notify,
+        result = evaluate(state, events, now,
                           pending_timeout_min=args.pending_timeout_min,
                           cooldown_hours=args.cooldown_hours)
 
         notified = False
         if args.notify:
             if result.alert_message:
-                send_notification(result.alert_message, args.notify_bin)
-                notified = True
+                # Consume the cooldown only on confirmed delivery; a failed
+                # send leaves the incident unalerted so the next run retries.
+                if send_notification(result.alert_message, args.notify_bin):
+                    mark_alerted(state, now)
+                    notified = True
             if result.recovery_message:
-                send_notification(result.recovery_message, args.notify_bin)
-                notified = True
+                if send_notification(result.recovery_message, args.notify_bin):
+                    notified = True
 
         state["log"] = log_state
         state["checked_at"] = now.strftime(TS_FORMAT)
