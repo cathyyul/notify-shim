@@ -151,6 +151,21 @@ hourly and alerts through `notify-dm` when it sees `session_stale_relogin` or a
 list; same-cause alerts are deduped for 12h but a newly affected task re-alerts,
 and the first confirmed run after an alert sends a recovery notice.
 
+Not being able to look is itself an incident. If the log or the state file
+cannot be read, or a rotation leaves a gap the watchdog cannot prove it read
+through, it alerts saying so rather than reporting healthy — a watchdog that is
+quietly blind is the failure this tool exists to catch. Alerts and recovery
+notices are only recorded as sent once `notify-dm` accepts them, so a failed
+send is retried on the next run instead of being silenced by the cooldown.
+
+**Known limitation — accounting is per task, not per invocation.** The log
+carries no invocation id, so if a task spawns twice inside the 15-minute window
+and only the later run confirms, the earlier missed run is not reported. In
+practice the scheduled routines are daily or hourly with a single in-flight
+invocation, so this needs a manual rerun or a catch-up dispatch to overlap the
+original schedule. Inferring invocation identity from second-resolution
+timestamps was tried and removed: it produced more bugs than it caught.
+
 ```sh
 python3 notifiers/claude_scheduler_watchdog.py --json      # check only
 python3 notifiers/claude_scheduler_watchdog.py --notify    # alert via notify-dm

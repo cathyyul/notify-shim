@@ -148,28 +148,66 @@ def read_new_lines(log_path: Path, log_state: "Optional[dict[str, Any]]",
         return LogRead([], None, cold, f"無法讀取 {log_path}：{exc}")
 
 
+def _rotation_index(path: Path, stem: str, suffix: str) -> Optional[int]:
+    """main1.log -> 1, main12.log -> 12, anything else -> None."""
+    name = path.name
+    middle = name[len(stem):len(name) - len(suffix)]
+    return int(middle) if middle.isdigit() else None
+
+
+def _drain_rotation_chain(log_path: Path, stored_ino: Optional[int], stored_off: int,
+                          lines: "list[str]") -> Optional[str]:
+    """Read every generation between the stored cursor and the live file.
+
+    Returns a blocking reason when continuity cannot be proven. Draining only the
+    file that matches the stored inode and then jumping straight to the live log
+    skips whole generations whenever two rotations happen between checks — and
+    the run would report healthy having never parsed them.
+    """
+    pattern = f"{log_path.stem}[0-9]*{log_path.suffix}"
+    siblings: "list[tuple[int, Path, Any]]" = []
+    for sibling in log_path.parent.glob(pattern):
+        try:
+            sib_st = sibling.stat()
+        except OSError:
+            continue  # a glob race, not an observation failure
+        index = _rotation_index(sibling, log_path.stem, log_path.suffix)
+        if index is not None:
+            siblings.append((index, sibling, sib_st))
+
+    resume = next((s for s in siblings if s[2].st_ino == stored_ino), None)
+    if resume is None:
+        return (f"日誌已輪替，找不到上次讀到的檔案（inode {stored_ino}）"
+                "——中間可能有整段紀錄沒被讀到")
+
+    resume_index, resume_path, resume_st = resume
+    tail, _ = _read_complete_lines(resume_path, min(stored_off, resume_st.st_size))
+    lines.extend(tail)
+    # A lower rotation index is a more recent generation, so walk down towards
+    # the live file and pick up everything that rotated in between.
+    for _index, sibling, _sib_st in sorted(
+            (s for s in siblings if s[0] < resume_index),
+            key=lambda item: item[0], reverse=True):
+        generation, _ = _read_complete_lines(sibling, 0)
+        lines.extend(generation)
+    return None
+
+
 def _read_log(log_path: Path, stored_ino: Optional[int], stored_off: int, cold: bool,
               bootstrap_since: Optional[dt.datetime]) -> LogRead:
     lines: "list[str]" = []
     st = log_path.stat()
 
-    if not cold and stored_ino == st.st_ino and stored_off <= st.st_size:
-        start = stored_off
+    if not cold and stored_ino == st.st_ino:
+        # Same file. If it shrank it was truncated in place, so start over
+        # rather than seeking past the end.
+        start = stored_off if stored_off <= st.st_size else 0
     else:
         start = 0
         if not cold:
-            # The previous main.log was rotated away; find it by inode among
-            # the rotated siblings (main1.log, main2.log, ...) and drain its tail.
-            pattern = f"{log_path.stem}[0-9]*{log_path.suffix}"
-            for sibling in sorted(log_path.parent.glob(pattern)):
-                try:
-                    sib_st = sibling.stat()
-                except OSError:
-                    continue
-                if sib_st.st_ino == stored_ino and stored_off <= sib_st.st_size:
-                    tail, _ = _read_complete_lines(sibling, stored_off)
-                    lines.extend(tail)
-                    break
+            blocked = _drain_rotation_chain(log_path, stored_ino, stored_off, lines)
+            if blocked is not None:
+                return LogRead([], None, cold, blocked)
         elif bootstrap_since is not None:
             # Cold start — a fresh deploy, or state we just quarantined as
             # corrupt. An incident already under way may have left its evidence
@@ -192,26 +230,6 @@ def _read_log(log_path: Path, stored_ino: Optional[int], stored_off: int, cold: 
     new_lines, new_off = _read_complete_lines(log_path, start)
     lines.extend(new_lines)
     return LogRead(lines, {"inode": st.st_ino, "offset": new_off}, cold)
-
-
-def _consume_pending(pending: "list[dict[str, Any]]", task: Optional[str],
-                     ts: Optional[dt.datetime],
-                     ) -> "tuple[list[dict[str, Any]], Optional[dict[str, Any]]]":
-    """Resolve exactly one outstanding spawn of ``task`` — the one this event followed.
-
-    The log carries no invocation id, so the pairing is inferred from order: a
-    ``Confirmed task run`` normally lands a second or two after the spawn it
-    belongs to, which makes the newest spawn at or before the event the match.
-    Dropping every row for the task instead (the original behaviour) let one
-    healthy rerun erase an earlier invocation that really was missed.
-    """
-    matches = [i for i, p in enumerate(pending) if p["task"] == task]
-    if not matches:
-        return pending, None
-    eligible = [i for i in matches
-                if ts is None or (parse_ts(pending[i].get("ts")) or ts) <= ts]
-    idx = (eligible or matches)[-1]
-    return pending[:idx] + pending[idx + 1:], pending[idx]
 
 
 def format_alert(incident: "dict[str, Any]") -> str:
@@ -276,8 +294,20 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
     pending: "list[dict[str, Any]]" = list(state.get("pending_spawns", []))
     incident: "Optional[dict[str, Any]]" = state.get("active_incident")
 
-    failed: "dict[str, Optional[dt.datetime]]" = {}
-    confirms: "dict[str, dt.datetime]" = {}
+    # Carry the unresolved failures in BEFORE walking the events, so the events
+    # resolve them in log order. Comparing timestamps instead cannot work: the
+    # log's one-second resolution cannot say whether a confirm or a cleared
+    # dispatch in the same second came first, and the two orders mean opposite
+    # things. Log order is the only ordering the log actually gives us.
+    open_failures: "dict[str, Optional[dt.datetime]]" = {}
+    stale_open = False
+    stale_at: Optional[dt.datetime] = None
+    if incident is not None:
+        for task, ts_str in (incident.get("open_failures") or {}).items():
+            open_failures[task] = parse_ts(ts_str)
+        stale_open = bool(incident.get("stale_open"))
+        stale_at = parse_ts(incident.get("stale_last_at"))
+
     window_first_failure: Optional[dt.datetime] = None
     window_last_failure: Optional[dt.datetime] = None
     window_stale_at: Optional[dt.datetime] = None
@@ -287,13 +317,7 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
     def note_failure(task: Optional[str], ts: Optional[dt.datetime]) -> None:
         nonlocal window_first_failure, window_last_failure
         if task is not None:
-            # Keep the NEWEST failure per task. Keeping the first one let the
-            # resolution pass below compare a later confirm against a stale
-            # timestamp and clear a task that had broken again since — one scan
-            # window can hold fail → confirm → fail for the same task.
-            prev = failed.get(task)
-            if task not in failed or (ts is not None and (prev is None or ts > prev)):
-                failed[task] = ts
+            open_failures[task] = ts
         if ts is not None:
             if window_first_failure is None or ts < window_first_failure:
                 window_first_failure = ts
@@ -305,23 +329,17 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
         if ev.kind == "spawn":
             pending.append({"task": ev.task, "ts": fmt_ts(ev.ts)})
         elif ev.kind == "confirm":
-            pending, consumed = _consume_pending(pending, ev.task, ev.ts)
+            # Task-level accounting (see the limitation noted in the README): a
+            # confirm says this task is running again, so it closes whatever was
+            # outstanding for it.
+            pending = [p for p in pending if p["task"] != ev.task]
+            open_failures.pop(ev.task, None)
             if ev.ts is not None and (newest_confirm_at is None or ev.ts > newest_confirm_at):
-                # Every confirm counts as proof that spawning works again, even
-                # one already spent below — that is what lifts a login latch.
                 newest_confirm_at = ev.ts
-            if consumed is None and ev.ts is not None and (
-                    ev.task not in confirms or ev.ts > confirms[ev.task]):
-                # Only a confirm that closed nothing is free to resolve a failure
-                # carried over from an earlier window. One that just closed a
-                # pending spawn belongs to that invocation, and reusing it would
-                # absolve a different run of the same task that really was missed.
-                confirms[ev.task] = ev.ts
             last_confirm = ev
         elif ev.kind == "cleared":
-            pending, consumed = _consume_pending(pending, ev.task, ev.ts)
-            spawned_at = parse_ts((consumed or {}).get("ts"))
-            note_failure(ev.task, spawned_at or ev.ts)
+            pending = [p for p in pending if p["task"] != ev.task]
+            note_failure(ev.task, ev.ts)
         elif ev.kind == "stale":
             stale_seen = True
             if ev.ts is not None and (window_stale_at is None or ev.ts > window_stale_at):
@@ -337,36 +355,10 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
             still_pending.append(p)
     state["pending_spawns"] = still_pending
 
-    # Carry the unresolved failures forward, then resolve them against this
-    # window's confirms. A confirm is evidence about the task it names and
-    # nothing else, so a healthy task can no longer bury another task's timeout
-    # or fake a recovery for it.
-    open_failures: "dict[str, Optional[dt.datetime]]" = {}
-    stale_open = False
-    stale_at: Optional[dt.datetime] = None
-    if incident is not None:
-        for task, ts_str in (incident.get("open_failures") or {}).items():
-            open_failures[task] = parse_ts(ts_str)
-        stale_open = bool(incident.get("stale_open"))
-        stale_at = parse_ts(incident.get("stale_last_at"))
-    for task, ts in failed.items():
-        prev = open_failures.get(task)
-        if task not in open_failures or (ts is not None and (prev is None or ts > prev)):
-            open_failures[task] = ts
     if stale_seen:
         stale_open = True
     if window_stale_at is not None and (stale_at is None or window_stale_at > stale_at):
         stale_at = window_stale_at
-
-    for task in list(open_failures):
-        confirmed_at = confirms.get(task)
-        failed_at = open_failures[task]
-        # ``>=`` because a spawn and its confirm routinely land in the same
-        # second: if the spawn aged out in an earlier window, its confirm
-        # arriving later carries that identical timestamp and must still clear
-        # it, or the task stays open forever.
-        if confirmed_at is not None and (failed_at is None or confirmed_at >= failed_at):
-            del open_failures[task]
 
     # A stale-login latch blocks every spawn, so any confirm after the last
     # stale line proves the latch is gone and the failures it held down were

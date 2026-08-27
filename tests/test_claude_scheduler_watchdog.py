@@ -771,47 +771,6 @@ class TestCursorIsNeverASentinel:
         assert second.cold is False
 
 
-class TestPendingSpawnGranularity:
-    """One confirm resolves one spawn, not every pending row for that task.
-
-    Raised by the reviewer in rounds 3 and 4; folded into the approved redesign.
-    """
-
-    SPAWN_0900 = ("2026-08-22 09:00:00 [info] [CCDScheduledTasks] Spawning new session "
-                  "for scheduled task process-replies { cronExpression: '0 9 * * *' }")
-    SPAWN_0910 = ("2026-08-22 09:10:00 [info] [CCDScheduledTasks] Spawning new session "
-                  "for scheduled task process-replies { cronExpression: '0 9 * * *' }")
-    CONFIRM_0912 = ("2026-08-22 09:12:00 [info] [CCDScheduledTasks] "
-                    "Confirmed task run for: process-replies")
-
-    def test_one_confirm_leaves_the_earlier_spawn_outstanding(self):
-        state = {}
-        mod.evaluate(state, mod.parse_events(
-            [self.SPAWN_0900, self.SPAWN_0910, self.CONFIRM_0912]),
-            now=T("2026-08-22 09:13:00"))
-        assert [p["ts"] for p in state["pending_spawns"]] == ["2026-08-22 09:00:00"]
-
-    def test_the_missed_run_still_alerts(self):
-        state = {}
-        mod.evaluate(state, mod.parse_events(
-            [self.SPAWN_0900, self.SPAWN_0910, self.CONFIRM_0912]),
-            now=T("2026-08-22 09:13:00"))
-        result = mod.evaluate(state, [], now=T("2026-08-22 09:30:00"))
-        assert result.alert_message is not None
-        assert "process-replies" in result.alert_message
-
-    def test_a_confirm_pairs_with_the_spawn_it_followed(self):
-        # both spawns confirmed: nothing outstanding, nothing to alert about
-        second_confirm = ("2026-08-22 09:14:00 [info] [CCDScheduledTasks] "
-                          "Confirmed task run for: process-replies")
-        state = {}
-        result = mod.evaluate(state, mod.parse_events(
-            [self.SPAWN_0900, self.SPAWN_0910, self.CONFIRM_0912, second_confirm]),
-            now=T("2026-08-22 09:30:00"))
-        assert state["pending_spawns"] == []
-        assert result.alert_message is None
-
-
 class TestSameTaskFailureAccounting:
     """Within one scan window a task can fail, recover, and fail again.
 
@@ -942,60 +901,6 @@ class TestStateFileFailuresAreLoud:
         assert any("session_stale_relogin" in message for message in sent)
 
 
-class TestConfirmIsSpentOnOneInvocation:
-    """A confirm belongs to the invocation it closed and cannot absolve another.
-
-    Round-6 review [high]: ``_consume_pending`` paired the confirm with the right
-    spawn, but the confirm also stayed in the task-keyed ``confirms`` map, so when
-    the *other* spawn later timed out the same confirm cleared it. The round-5
-    test scanned at 09:13 — before the older spawn expired — and missed it.
-    """
-
-    SPAWN_0900 = ("2026-08-22 09:00:00 [info] [CCDScheduledTasks] Spawning new session "
-                  "for scheduled task process-replies { cronExpression: '0 9 * * *' }")
-    SPAWN_0910 = ("2026-08-22 09:10:00 [info] [CCDScheduledTasks] Spawning new session "
-                  "for scheduled task process-replies { cronExpression: '0 9 * * *' }")
-    CONFIRM_0912 = ("2026-08-22 09:12:00 [info] [CCDScheduledTasks] "
-                    "Confirmed task run for: process-replies")
-
-    def test_missed_run_survives_when_the_whole_sequence_lands_in_one_scan(self):
-        state = {}
-        result = mod.evaluate(state, mod.parse_events(
-            [self.SPAWN_0900, self.SPAWN_0910, self.CONFIRM_0912]),
-            now=T("2026-08-22 09:30:00"))
-        assert result.incident_active is True
-        assert result.alert_message is not None
-        assert "process-replies" in result.alert_message
-
-    def test_an_unspent_confirm_still_resolves_a_carried_over_failure(self):
-        # the spawn aged out in an earlier window, so its confirm arrives alone
-        state = {}
-        mod.evaluate(state, mod.parse_events([self.SPAWN_0900]), now=T("2026-08-22 09:30:00"))
-        mod.mark_alerted(state, T("2026-08-22 09:30:00"))
-        result = mod.evaluate(state, mod.parse_events([self.CONFIRM_0912]),
-                              now=T("2026-08-22 09:40:00"))
-        assert result.incident_active is False
-        assert result.recovery_message is not None
-
-    def test_a_paired_confirm_still_proves_the_latch_is_gone(self):
-        # a spawn/confirm pair in one window is proof the login latch lifted,
-        # even though that confirm is spent on its own invocation
-        state = {}
-        mod.evaluate(state, mod.parse_events([SPAWN_LINE] + STALE_LINES),
-                     now=T("2026-08-18 13:00:00"))
-        mod.mark_alerted(state, T("2026-08-18 13:00:00"))
-        recovery_pair = [
-            "2026-08-19 12:06:15 [info] [CCDScheduledTasks] Spawning new session for "
-            "scheduled task daily-memory-sync { cronExpression: '0 12 * * *' }",
-            "2026-08-19 12:06:15 [info] [CCDScheduledTasks] Confirmed task run for: "
-            "daily-memory-sync",
-        ]
-        result = mod.evaluate(state, mod.parse_events(recovery_pair),
-                              now=T("2026-08-19 12:10:00"))
-        assert result.incident_active is False
-        assert result.recovery_message is not None
-
-
 class TestLogReadFailuresAreLoud:
     """stat() succeeding is not the same as being able to read the file.
 
@@ -1057,6 +962,143 @@ class TestLogReadFailuresAreLoud:
         read = mod.read_new_lines(
             main, {}, bootstrap_since=dt.datetime.now() - dt.timedelta(hours=24))
         assert read.lines == ["current"]
+        assert read.blocked_reason is None
+
+
+class TestEventsResolveInLogOrder:
+    """Same-second events are ordered by the log, not by their timestamps.
+
+    Round-7 review [high]: resolution compared second-resolution timestamps, so a
+    Confirmed followed in the log by a Cleared for the same task within the same
+    second looked "confirmed after failure" and the failure was deleted. Seconds
+    cannot express that ordering, so resolution now happens while walking the
+    events, in the order the log lists them.
+    """
+
+    CONFIRM = ("2026-08-22 10:00:00 [info] [CCDScheduledTasks] "
+               "Confirmed task run for: process-replies")
+    CLEARED = ("2026-08-22 10:00:00 [warn] [CCDScheduledTasks] "
+               "Cleared stale pending dispatch for: process-replies")
+
+    def test_failure_after_a_same_second_confirm_survives(self):
+        state = {}
+        result = mod.evaluate(state, mod.parse_events([self.CONFIRM, self.CLEARED]),
+                              now=T("2026-08-22 10:30:00"))
+        assert result.incident_active is True
+        assert result.alert_message is not None
+        assert "process-replies" in result.alert_message
+
+    def test_confirm_after_a_same_second_failure_resolves(self):
+        state = {}
+        result = mod.evaluate(state, mod.parse_events([self.CLEARED, self.CONFIRM]),
+                              now=T("2026-08-22 10:30:00"))
+        assert result.incident_active is False
+        assert result.alert_message is None
+
+    def test_a_confirm_closes_a_failure_carried_across_windows(self):
+        # no timestamp comparison is involved: the confirm simply closes the task
+        state = {}
+        mod.evaluate(state, mod.parse_events([NORMAL_SPAWN]), now=T("2026-08-20 13:00:00"))
+        mod.mark_alerted(state, T("2026-08-20 13:00:00"))
+        result = mod.evaluate(state, mod.parse_events([NORMAL_CONFIRM]),
+                              now=T("2026-08-20 13:30:00"))
+        assert result.incident_active is False
+        assert result.recovery_message is not None
+
+
+class TestTaskLevelAccountingLimitation:
+    """Accounting is per task, not per invocation — a deliberate limitation.
+
+    Yuting approved dropping per-invocation tracking (issue #22, 2026-08-27):
+    it was never in the acceptance criteria and the log carries no invocation id,
+    so four of the PR's bugs came from trying to infer one. This test pins the
+    resulting blind spot so nobody "fixes" it by accident; it is documented in
+    the README.
+    """
+
+    SPAWN_0900 = ("2026-08-22 09:00:00 [info] [CCDScheduledTasks] Spawning new session "
+                  "for scheduled task process-replies { cronExpression: '0 9 * * *' }")
+    SPAWN_0910 = ("2026-08-22 09:10:00 [info] [CCDScheduledTasks] Spawning new session "
+                  "for scheduled task process-replies { cronExpression: '0 9 * * *' }")
+    CONFIRM_0912 = ("2026-08-22 09:12:00 [info] [CCDScheduledTasks] "
+                    "Confirmed task run for: process-replies")
+
+    def test_a_rerun_inside_the_window_masks_the_earlier_missed_run(self):
+        state = {}
+        result = mod.evaluate(state, mod.parse_events(
+            [self.SPAWN_0900, self.SPAWN_0910, self.CONFIRM_0912]),
+            now=T("2026-08-22 09:30:00"))
+        # KNOWN LIMITATION: the 09:00 invocation never confirmed, but the task is
+        # demonstrably running again, so no alert is raised.
+        assert result.incident_active is False
+        assert state["pending_spawns"] == []
+
+
+class TestRotationChain:
+    """Every generation between the cursor and the live file must be read.
+
+    Round-7 review [high]: the warm-resume path drained only the sibling matching
+    the stored inode and then jumped to the live main.log, so two rotations
+    between checks skipped a whole generation — while advancing the cursor and
+    reporting healthy.
+    """
+
+    def _rotate(self, d):
+        """main1.log -> main2.log, main.log -> main1.log, fresh main.log."""
+        if (d / "main2.log").exists():
+            (d / "main2.log").unlink()
+        if (d / "main1.log").exists():
+            (d / "main1.log").rename(d / "main2.log")
+        (d / "main.log").rename(d / "main1.log")
+
+    def test_two_rotations_lose_nothing(self, tmp_path):
+        main = tmp_path / "main.log"
+        main.write_text("A1\nA2\n", encoding="utf-8")
+        first = mod.read_new_lines(main, {})
+        assert first.lines == ["A1", "A2"]
+
+        with main.open("a", encoding="utf-8") as f:
+            f.write("A3\n")
+        self._rotate(tmp_path)
+        main.write_text("B1\nB2\n", encoding="utf-8")
+        self._rotate(tmp_path)
+        main.write_text("C1\n", encoding="utf-8")
+
+        read = mod.read_new_lines(main, first.cursor)
+        assert read.lines == ["A3", "B1", "B2", "C1"]
+        assert read.blocked_reason is None
+
+    def test_single_rotation_still_works(self, tmp_path):
+        main = tmp_path / "main.log"
+        main.write_text("A1\n", encoding="utf-8")
+        first = mod.read_new_lines(main, {})
+        with main.open("a", encoding="utf-8") as f:
+            f.write("A2\n")
+        self._rotate(tmp_path)
+        main.write_text("B1\n", encoding="utf-8")
+        read = mod.read_new_lines(main, first.cursor)
+        assert read.lines == ["A2", "B1"]
+
+    def test_aged_out_cursor_blocks_instead_of_skipping(self, tmp_path):
+        main = tmp_path / "main.log"
+        main.write_text("A1\n", encoding="utf-8")
+        first = mod.read_new_lines(main, {})
+        # the generation our cursor pointed at is gone entirely
+        main.unlink()
+        main.write_text("B1\n", encoding="utf-8")
+        read = mod.read_new_lines(main, first.cursor)
+        assert read.blocked_reason is not None
+        assert read.cursor is None
+        assert read.lines == []
+
+    def test_truncation_in_place_restarts_rather_than_blocking(self, tmp_path):
+        main = tmp_path / "main.log"
+        main.write_text("A1\nA2\n", encoding="utf-8")
+        first = mod.read_new_lines(main, {})
+        with main.open("w", encoding="utf-8") as f:  # same inode, shorter
+            f.write("B1\n")
+        read = mod.read_new_lines(main, first.cursor)
+        assert read.lines == ["B1"]
         assert read.blocked_reason is None
 
 
