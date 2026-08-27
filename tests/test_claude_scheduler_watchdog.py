@@ -942,6 +942,124 @@ class TestStateFileFailuresAreLoud:
         assert any("session_stale_relogin" in message for message in sent)
 
 
+class TestConfirmIsSpentOnOneInvocation:
+    """A confirm belongs to the invocation it closed and cannot absolve another.
+
+    Round-6 review [high]: ``_consume_pending`` paired the confirm with the right
+    spawn, but the confirm also stayed in the task-keyed ``confirms`` map, so when
+    the *other* spawn later timed out the same confirm cleared it. The round-5
+    test scanned at 09:13 — before the older spawn expired — and missed it.
+    """
+
+    SPAWN_0900 = ("2026-08-22 09:00:00 [info] [CCDScheduledTasks] Spawning new session "
+                  "for scheduled task process-replies { cronExpression: '0 9 * * *' }")
+    SPAWN_0910 = ("2026-08-22 09:10:00 [info] [CCDScheduledTasks] Spawning new session "
+                  "for scheduled task process-replies { cronExpression: '0 9 * * *' }")
+    CONFIRM_0912 = ("2026-08-22 09:12:00 [info] [CCDScheduledTasks] "
+                    "Confirmed task run for: process-replies")
+
+    def test_missed_run_survives_when_the_whole_sequence_lands_in_one_scan(self):
+        state = {}
+        result = mod.evaluate(state, mod.parse_events(
+            [self.SPAWN_0900, self.SPAWN_0910, self.CONFIRM_0912]),
+            now=T("2026-08-22 09:30:00"))
+        assert result.incident_active is True
+        assert result.alert_message is not None
+        assert "process-replies" in result.alert_message
+
+    def test_an_unspent_confirm_still_resolves_a_carried_over_failure(self):
+        # the spawn aged out in an earlier window, so its confirm arrives alone
+        state = {}
+        mod.evaluate(state, mod.parse_events([self.SPAWN_0900]), now=T("2026-08-22 09:30:00"))
+        mod.mark_alerted(state, T("2026-08-22 09:30:00"))
+        result = mod.evaluate(state, mod.parse_events([self.CONFIRM_0912]),
+                              now=T("2026-08-22 09:40:00"))
+        assert result.incident_active is False
+        assert result.recovery_message is not None
+
+    def test_a_paired_confirm_still_proves_the_latch_is_gone(self):
+        # a spawn/confirm pair in one window is proof the login latch lifted,
+        # even though that confirm is spent on its own invocation
+        state = {}
+        mod.evaluate(state, mod.parse_events([SPAWN_LINE] + STALE_LINES),
+                     now=T("2026-08-18 13:00:00"))
+        mod.mark_alerted(state, T("2026-08-18 13:00:00"))
+        recovery_pair = [
+            "2026-08-19 12:06:15 [info] [CCDScheduledTasks] Spawning new session for "
+            "scheduled task daily-memory-sync { cronExpression: '0 12 * * *' }",
+            "2026-08-19 12:06:15 [info] [CCDScheduledTasks] Confirmed task run for: "
+            "daily-memory-sync",
+        ]
+        result = mod.evaluate(state, mod.parse_events(recovery_pair),
+                              now=T("2026-08-19 12:10:00"))
+        assert result.incident_active is False
+        assert result.recovery_message is not None
+
+
+class TestLogReadFailuresAreLoud:
+    """stat() succeeding is not the same as being able to read the file.
+
+    Round-6 review [high]: the round-5 OSError guard only wrapped ``stat()``, so a
+    log that stats fine but denies open raised inside ``_read_complete_lines``,
+    straight into main()'s catch-all — exit 2, no DM.
+    """
+
+    @staticmethod
+    def _denied(*_args, **_kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    def test_unreadable_log_is_reported_not_raised(self, tmp_path, monkeypatch):
+        log = tmp_path / "main.log"
+        log.write_text("line\n", encoding="utf-8")
+        monkeypatch.setattr(mod, "_read_complete_lines", self._denied)
+        read = mod.read_new_lines(log, {})
+        assert read.lines == []
+        assert read.cursor is None
+        assert read.blocked_reason is not None
+
+    def test_unreadable_rotated_sibling_is_reported(self, tmp_path, monkeypatch):
+        sibling = tmp_path / "main1.log"
+        sibling.write_text("rotated\n", encoding="utf-8")
+        main = tmp_path / "main.log"
+        main.write_text("current\n", encoding="utf-8")
+        real = mod._read_complete_lines
+
+        def selective(path, start):
+            if path == sibling:
+                raise PermissionError(13, "Permission denied")
+            return real(path, start)
+
+        monkeypatch.setattr(mod, "_read_complete_lines", selective)
+        read = mod.read_new_lines(
+            main, {}, bootstrap_since=dt.datetime.now() - dt.timedelta(hours=24))
+        assert read.blocked_reason is not None
+        assert read.cursor is None
+
+    def test_main_alerts_instead_of_exiting_two(self, tmp_path, monkeypatch):
+        log = tmp_path / "main.log"
+        log.write_text("line\n", encoding="utf-8")
+        monkeypatch.setattr(mod, "_read_complete_lines", self._denied)
+        sent = []
+        monkeypatch.setattr(mod, "send_notification",
+                            lambda message, _bin: (sent.append(message), True)[1])
+        monkeypatch.setattr(sys, "argv", [
+            "claude_scheduler_watchdog.py", "--log-file", str(log),
+            "--state-file", str(tmp_path / "state.json"), "--notify",
+        ])
+        assert mod.main() == 1
+        assert sent
+        assert "無法觀測" in sent[0]
+
+    def test_a_vanishing_sibling_is_tolerated(self, tmp_path):
+        # glob races are not observation failures; only the main log matters here
+        main = tmp_path / "main.log"
+        main.write_text("current\n", encoding="utf-8")
+        read = mod.read_new_lines(
+            main, {}, bootstrap_since=dt.datetime.now() - dt.timedelta(hours=24))
+        assert read.lines == ["current"]
+        assert read.blocked_reason is None
+
+
 class TestFormatting:
     def test_stale_alert_carries_cause_and_fix(self):
         incident = {"causes": ["session_stale_relogin"],

@@ -138,14 +138,20 @@ def read_new_lines(log_path: Path, log_state: "Optional[dict[str, Any]]",
     stored_ino = (log_state or {}).get("inode")
     stored_off = (log_state or {}).get("offset", 0)
     cold = stored_ino is None
-    lines: "list[str]" = []
     try:
-        st = log_path.stat()
+        return _read_log(log_path, stored_ino, stored_off, cold, bootstrap_since)
     except OSError as exc:
-        # We observed nothing at all. Return no cursor: absence has to stay
-        # absence, because a placeholder cursor reads as a warm resume on the
-        # next run and quietly disables the bootstrap below.
+        # stat, open or read — of the main log or of a rotated file we needed.
+        # Any of them means we did not observe, so say so and return no cursor:
+        # absence has to stay absence, because a placeholder cursor reads as a
+        # warm resume on the next run and quietly disables the bootstrap.
         return LogRead([], None, cold, f"無法讀取 {log_path}：{exc}")
+
+
+def _read_log(log_path: Path, stored_ino: Optional[int], stored_off: int, cold: bool,
+              bootstrap_since: Optional[dt.datetime]) -> LogRead:
+    lines: "list[str]" = []
+    st = log_path.stat()
 
     if not cold and stored_ino == st.st_ino and stored_off <= st.st_size:
         start = stored_off
@@ -275,6 +281,7 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
     window_first_failure: Optional[dt.datetime] = None
     window_last_failure: Optional[dt.datetime] = None
     window_stale_at: Optional[dt.datetime] = None
+    newest_confirm_at: Optional[dt.datetime] = None
     last_confirm: Optional[LogEvent] = None
 
     def note_failure(task: Optional[str], ts: Optional[dt.datetime]) -> None:
@@ -298,8 +305,17 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
         if ev.kind == "spawn":
             pending.append({"task": ev.task, "ts": fmt_ts(ev.ts)})
         elif ev.kind == "confirm":
-            pending, _ = _consume_pending(pending, ev.task, ev.ts)
-            if ev.ts is not None and (ev.task not in confirms or ev.ts > confirms[ev.task]):
+            pending, consumed = _consume_pending(pending, ev.task, ev.ts)
+            if ev.ts is not None and (newest_confirm_at is None or ev.ts > newest_confirm_at):
+                # Every confirm counts as proof that spawning works again, even
+                # one already spent below — that is what lifts a login latch.
+                newest_confirm_at = ev.ts
+            if consumed is None and ev.ts is not None and (
+                    ev.task not in confirms or ev.ts > confirms[ev.task]):
+                # Only a confirm that closed nothing is free to resolve a failure
+                # carried over from an earlier window. One that just closed a
+                # pending spawn belongs to that invocation, and reusing it would
+                # absolve a different run of the same task that really was missed.
                 confirms[ev.task] = ev.ts
             last_confirm = ev
         elif ev.kind == "cleared":
@@ -355,7 +371,7 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
     # A stale-login latch blocks every spawn, so any confirm after the last
     # stale line proves the latch is gone and the failures it held down were
     # symptoms of it. Anything that broke after the latch stands on its own.
-    newest_confirm = max(confirms.values()) if confirms else None
+    newest_confirm = newest_confirm_at
     if stale_open and newest_confirm is not None and (stale_at is None
                                                       or newest_confirm > stale_at):
         stale_open = False
