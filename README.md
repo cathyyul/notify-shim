@@ -180,6 +180,18 @@ every edge; each was adjudicated on issue #22 rather than hardened further.
   alert.** Per-task failures resolve in log order, but the global latch check
   compares timestamps, so recovery proven within the same second can page once
   before the next scan clears it.
+- **A rotation landing between the `stat()` and the read binds the cursor to
+  the wrong file.** The live log is statted once and reopened by pathname, so a
+  rotation inside that window returns the new file's offset paired with the old
+  file's inode, and the next run resumes at an unrelated position. The window is
+  microseconds against a rotation every few days, so this is left as a race
+  rather than fixed by re-opening and `fstat`ing.
+- **An unwritable state file re-sends alerts every hour.** Delivery happens
+  before persistence and a failed `save_json` is only logged, so a run that
+  cannot save its bookkeeping repeats the same alert on the next tick. Dedup
+  would need an idempotency key that `notify-dm` records independently. Noisy is
+  the intended direction to fail in — this watchdog exists because silence is
+  the worse outcome.
 
 ```sh
 python3 notifiers/claude_scheduler_watchdog.py --json      # check only
