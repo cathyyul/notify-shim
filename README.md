@@ -158,13 +158,28 @@ quietly blind is the failure this tool exists to catch. Alerts and recovery
 notices are only recorded as sent once `notify-dm` accepts them, so a failed
 send is retried on the next run instead of being silenced by the cooldown.
 
-**Known limitation — accounting is per task, not per invocation.** The log
-carries no invocation id, so if a task spawns twice inside the 15-minute window
-and only the later run confirms, the earlier missed run is not reported. In
-practice the scheduled routines are daily or hourly with a single in-flight
-invocation, so this needs a manual rerun or a catch-up dispatch to overlap the
-original schedule. Inferring invocation identity from second-resolution
-timestamps was tried and removed: it produced more bugs than it caught.
+### Known limitations
+
+These are accepted, not overlooked. The watchdog covers the failure that
+actually happened (a silent 20h outage) and deliberately stops short of proving
+every edge; each was adjudicated on issue #22 rather than hardened further.
+
+- **Accounting is per task, not per invocation.** The log carries no invocation
+  id, so if a task spawns twice inside the 15-minute window and only the later
+  run confirms, the earlier missed run is not reported. The scheduled routines
+  are daily or hourly with a single in-flight invocation, so this needs a manual
+  rerun or a catch-up dispatch to overlap the original schedule. Inferring
+  invocation identity from second-resolution timestamps was tried and removed:
+  it produced more bugs than it caught.
+- **A gap in the middle of the rotation chain is not detected.** If the
+  generation the cursor points at still exists, the reader walks the newer
+  generations it can find. Should an intermediate `mainN.log` be deleted, its
+  events are skipped without the run being marked blind. A missing *resume*
+  generation is still detected and does block.
+- **A stale-login line and a `Confirmed` line in the same second may still
+  alert.** Per-task failures resolve in log order, but the global latch check
+  compares timestamps, so recovery proven within the same second can page once
+  before the next scan clears it.
 
 ```sh
 python3 notifiers/claude_scheduler_watchdog.py --json      # check only

@@ -407,6 +407,7 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
             "affected_tasks": [],
             "last_alert_at": None,
             "alerted_tasks": [],
+            "alerted_causes": [],
             "last_failure_at": None,
         }
     causes = set()
@@ -434,9 +435,13 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
     alert_message = None
     last_alert = parse_ts(incident.get("last_alert_at"))
     new_tasks = set(incident["affected_tasks"]) - set(incident.get("alerted_tasks", []))
+    # A cause she has not been told about changes the remedy she is holding —
+    # "check the file permissions" is worse than useless once the real problem
+    # is an expired login. The cooldown dedupes repeats, not new diagnoses.
+    new_causes = set(incident["causes"]) - set(incident.get("alerted_causes", []))
     cooldown_over = (last_alert is None
                      or (now - last_alert) >= dt.timedelta(hours=cooldown_hours))
-    if cooldown_over or new_tasks:
+    if cooldown_over or new_tasks or new_causes:
         alert_message = format_alert(incident)
     return EvalResult(alert_message, None, incident_active=True)
 
@@ -454,6 +459,7 @@ def mark_alerted(state: "dict[str, Any]", now: dt.datetime) -> None:
         return
     incident["last_alert_at"] = fmt_ts(now)
     incident["alerted_tasks"] = incident["affected_tasks"]
+    incident["alerted_causes"] = incident["causes"]
 
 
 def mark_recovered(state: "dict[str, Any]") -> None:
@@ -465,26 +471,72 @@ def mark_recovered(state: "dict[str, Any]") -> None:
     state.pop("active_incident", None)
 
 
+def _quarantine_state(path: Path, why: str) -> None:
+    """Move an unusable state file aside so the next run starts clean.
+
+    Without this the watchdog dies in load_json every hour and nothing is
+    watching the scheduler until a human notices. The worst case of starting
+    clean is one duplicate alert, not permanent silence.
+    """
+    quarantine = path.with_name(path.name + ".corrupt")
+    try:
+        os.replace(path, quarantine)
+        print(f"state: unusable state file quarantined to {quarantine} ({why})",
+              file=sys.stderr)
+    except OSError as move_exc:
+        print(f"state: unusable state file could not be quarantined: {move_exc}",
+              file=sys.stderr)
+
+
+def _state_is_usable(state: Any) -> bool:
+    """Shape check for the decoded state.
+
+    Only the parts evaluate() iterates or indexes are checked. Valid JSON in the
+    wrong shape used to reach evaluate() and raise — ``{"pending_spawns": null}``
+    became ``list(None)`` — which main() turned into an opaque exit 2, hourly,
+    from a file that never changes on its own.
+    """
+    # A present key must hold the right type. An explicit ``null`` counts as
+    # wrong, not as absent: ``state.get(key, default)`` returns the None rather
+    # than the default, which is how ``{"pending_spawns": null}`` reached
+    # ``list(None)``.
+    def wrong(container: "dict[str, Any]", key: str, kind: type) -> bool:
+        return key in container and not isinstance(container[key], kind)
+
+    if not isinstance(state, dict):
+        return False
+    if wrong(state, "log", dict) or wrong(state, "pending_spawns", list):
+        return False
+    for row in state.get("pending_spawns") or []:
+        if not isinstance(row, dict) or not isinstance(row.get("task"), str):
+            return False
+    incident = state.get("active_incident")
+    if "active_incident" in state and incident is not None:
+        if not isinstance(incident, dict):
+            return False
+        for key in ("causes", "affected_tasks", "alerted_tasks", "alerted_causes"):
+            if wrong(incident, key, list):
+                return False
+        for key in ("open_failures", "resolved_by"):
+            if key in incident and incident[key] is not None \
+                    and not isinstance(incident[key], dict):
+                return False
+    return True
+
+
 def load_json(path: Path) -> "dict[str, Any]":
     if not path.exists():
         return {}
     try:
         with path.open(encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        # A half-written state file must not blind the watchdog forever: without
-        # this the next run dies in load_json every hour and nothing is watching
-        # the scheduler until a human notices. Quarantine it and start clean —
-        # the worst case is one duplicate alert, not permanent silence.
-        quarantine = path.with_name(path.name + ".corrupt")
-        try:
-            os.replace(path, quarantine)
-            print(f"state: corrupt state file quarantined to {quarantine} ({exc})",
-                  file=sys.stderr)
-        except OSError as move_exc:
-            print(f"state: corrupt state file could not be quarantined: {move_exc}",
-                  file=sys.stderr)
+        _quarantine_state(path, str(exc))
         return {}
+    if not _state_is_usable(data):
+        _quarantine_state(path, "結構不符預期")
+        return {}
+    return data
 
 
 def save_json(path: Path, payload: "dict[str, Any]") -> None:

@@ -1102,6 +1102,101 @@ class TestRotationChain:
         assert read.blocked_reason is None
 
 
+class TestCauseChangeAlerts:
+    """A changed diagnosis must reach her even inside the cooldown.
+
+    Round-8 review [high] (and the round-1 P2 that was never actioned): alert
+    eligibility looked only at elapsed time and newly affected tasks. So a
+    cannot-observe page followed an hour later by a real login expiry left her
+    holding the file-permission remedy for another 11 hours.
+    """
+
+    STALE = ("2026-08-22 10:00:00 [error] Cannot start session local_y: Unable to "
+             "start session. Sign in again to continue: session_stale_relogin")
+
+    def test_a_new_cause_alerts_inside_the_cooldown(self):
+        state = {}
+        mod.evaluate(state, [], now=T("2026-08-22 09:00:00"), blocked_reason="boom")
+        mod.mark_alerted(state, T("2026-08-22 09:00:00"))
+        result = mod.evaluate(state, mod.parse_events([self.STALE]),
+                              now=T("2026-08-22 10:01:00"))
+        assert result.alert_message is not None
+        assert "重新登入" in result.alert_message          # the remedy that changed
+        assert mod.CAUSE_STALE in state["active_incident"]["causes"]
+
+    def test_an_unchanged_cause_stays_deduped(self):
+        state = {}
+        mod.evaluate(state, mod.parse_events([self.STALE]), now=T("2026-08-22 10:01:00"))
+        mod.mark_alerted(state, T("2026-08-22 10:01:00"))
+        result = mod.evaluate(state, mod.parse_events([self.STALE]),
+                              now=T("2026-08-22 11:00:00"))
+        assert result.alert_message is None
+
+    def test_delivery_records_the_causes_it_covered(self):
+        state = {}
+        mod.evaluate(state, [], now=T("2026-08-22 09:00:00"), blocked_reason="boom")
+        mod.mark_alerted(state, T("2026-08-22 09:00:00"))
+        assert state["active_incident"]["alerted_causes"] == [mod.CAUSE_BLIND]
+
+    def test_an_undelivered_alert_does_not_record_causes(self):
+        state = {}
+        mod.evaluate(state, [], now=T("2026-08-22 09:00:00"), blocked_reason="boom")
+        assert state["active_incident"].get("alerted_causes", []) == []
+
+
+class TestStateShapeValidation:
+    """Valid JSON in the wrong shape must not disable the watchdog.
+
+    Round-8 review [high]: ``{"pending_spawns": null}`` decodes fine, then
+    ``evaluate`` did ``list(None)`` and main()'s catch-all turned the TypeError
+    into exit 2 with no DM — every hour, from an unchanging file.
+    """
+
+    def test_wrong_shaped_state_is_quarantined(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps({"pending_spawns": None}), encoding="utf-8")
+        assert mod.load_json(path) == {}
+        assert (tmp_path / "state.json.corrupt").exists()
+        assert not path.exists()
+
+    def test_non_dict_state_is_quarantined(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps(["not", "a", "state"]), encoding="utf-8")
+        assert mod.load_json(path) == {}
+        assert (tmp_path / "state.json.corrupt").exists()
+
+    def test_wrong_shaped_incident_is_quarantined(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps({"active_incident": {"causes": "stale"}}),
+                        encoding="utf-8")
+        assert mod.load_json(path) == {}
+
+    def test_a_well_formed_state_survives(self, tmp_path):
+        path = tmp_path / "state.json"
+        payload = {
+            "log": {"inode": 7, "offset": 12},
+            "pending_spawns": [{"task": "process-replies", "ts": "2026-08-22 09:00:00"}],
+            "active_incident": {"causes": ["session_stale_relogin"],
+                                "affected_tasks": ["process-replies"],
+                                "open_failures": {"process-replies": "2026-08-22 09:00:00"}},
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        assert mod.load_json(path) == payload
+        assert not (tmp_path / "state.json.corrupt").exists()
+
+    def test_main_survives_a_wrong_shaped_state(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({"pending_spawns": None}), encoding="utf-8")
+        log = tmp_path / "main.log"
+        log.write_text("2026-08-22 10:00:00 [info] nothing interesting\n", encoding="utf-8")
+        monkeypatch.setattr(mod, "send_notification", lambda *a, **k: True)
+        monkeypatch.setattr(sys, "argv", [
+            "claude_scheduler_watchdog.py", "--log-file", str(log),
+            "--state-file", str(state_file), "--notify",
+        ])
+        assert mod.main() == 0  # not the opaque exit 2
+
+
 class TestFormatting:
     def test_stale_alert_carries_cause_and_fix(self):
         incident = {"causes": ["session_stale_relogin"],
