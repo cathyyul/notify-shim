@@ -249,7 +249,11 @@ def format_alert(incident: "dict[str, Any]") -> str:
         lines.append(
             "修法：在 Mac mini 上重新登入 Claude desktop app；"
             "登入後排程會自動恢復（watchdog 會另發恢復通知）。")
-    elif CAUSE_UNCONFIRMED in causes:
+    if CAUSE_UNCONFIRMED in causes:
+        # Every active cause renders its own remedy. With `elif` here, an
+        # incident that was both a login latch and a task timeout only ever
+        # printed the re-login step — while mark_alerted() recorded both causes
+        # as delivered, so the task that was still down never got its own page.
         lines.append("原因：scheduled task spawn 後逾時未見 Confirmed task run（原因未知）。")
         lines.append("修法：查 ~/Library/Logs/Claude/main.log 的 [CCDScheduledTasks] 段。")
     tasks = incident.get("affected_tasks", [])
@@ -506,19 +510,29 @@ def _state_is_usable(state: Any) -> bool:
     def optional_text(value: Any) -> bool:
         return value is None or isinstance(value, str)
 
+    def optional_ts(value: Any) -> bool:
+        # Parse it, don't just type-check it. A string that is not a timestamp
+        # makes parse_ts() return None, which silently pins a pending spawn open
+        # forever — and raises nothing, so the quarantine net never fires.
+        return value is None or (isinstance(value, str) and parse_ts(value) is not None)
+
+    def whole_number(value: Any) -> bool:
+        # bool is a subclass of int, so isinstance() would let True through.
+        return type(value) is int and value >= 0
+
     if not isinstance(state, dict):
         return False
     if wrong(state, "log", dict) or wrong(state, "pending_spawns", list):
         return False
     log = state.get("log") or {}
-    if log.get("inode") is not None and not isinstance(log["inode"], int):
+    if log.get("inode") is not None and type(log["inode"]) is not int:
         return False
-    if "offset" in log and (not isinstance(log["offset"], int) or log["offset"] < 0):
+    if "offset" in log and not whole_number(log["offset"]):
         return False
     for row in state.get("pending_spawns") or []:
         if not isinstance(row, dict) or not isinstance(row.get("task"), str):
             return False
-        if not optional_text(row.get("ts")):
+        if not optional_ts(row.get("ts")):
             return False
     incident = state.get("active_incident")
     if "active_incident" in state and incident is not None:
@@ -529,20 +543,25 @@ def _state_is_usable(state: Any) -> bool:
                 return False
             if not all(isinstance(item, str) for item in incident.get(key) or []):
                 return False
-        for key in ("first_seen_at", "last_alert_at", "last_failure_at",
-                    "stale_last_at", "blind_reason"):
-            if not optional_text(incident.get(key)):
+        for key in ("first_seen_at", "last_alert_at", "last_failure_at", "stale_last_at"):
+            if not optional_ts(incident.get(key)):
                 return False
+        if not optional_text(incident.get("blind_reason")):
+            return False
+        if "stale_open" in incident and not isinstance(incident["stale_open"], bool):
+            return False
         for key in ("open_failures", "resolved_by"):
             if key in incident and incident[key] is not None \
                     and not isinstance(incident[key], dict):
                 return False
         for task, ts in (incident.get("open_failures") or {}).items():
-            if not isinstance(task, str) or not optional_text(ts):
+            if not isinstance(task, str) or not optional_ts(ts):
                 return False
-        for value in (incident.get("resolved_by") or {}).values():
-            if not optional_text(value):
-                return False
+        resolved = incident.get("resolved_by") or {}
+        if not optional_text(resolved.get("kind")) or not optional_text(resolved.get("task")):
+            return False
+        if not optional_ts(resolved.get("ts")):
+            return False
     return True
 
 

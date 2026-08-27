@@ -1271,6 +1271,119 @@ class TestMalformedNestedState:
         assert rc == 2
 
 
+class TestCombinedCauses:
+    """Every active cause must carry its own remedy into the message.
+
+    Round-10 review [high]: format_alert used ``if stale ... elif unconfirmed``,
+    so with both active only the re-login remedy rendered — while mark_alerted
+    recorded BOTH causes as delivered. Once the latch lifted and only the task
+    failure remained, no cause was "new", so she kept a remedy that no longer
+    applied and heard nothing more for 12 hours. This is the 2026-08-18 shape:
+    that incident had exactly these two causes.
+    """
+
+    STALE = ("2026-08-22 10:00:00 [error] Cannot start session local_z: Unable to "
+             "start session. Sign in again to continue: session_stale_relogin")
+    CLEARED = ("2026-08-22 10:05:00 [warn] [CCDScheduledTasks] "
+               "Cleared stale pending dispatch for: meal-plan-cart")
+
+    def _both_causes(self):
+        state = {}
+        result = mod.evaluate(state, mod.parse_events([self.STALE, self.CLEARED]),
+                              now=T("2026-08-22 10:06:00"))
+        return state, result
+
+    def test_both_remedies_are_in_the_message(self):
+        state, result = self._both_causes()
+        assert set(state["active_incident"]["causes"]) == {mod.CAUSE_STALE,
+                                                           mod.CAUSE_UNCONFIRMED}
+        assert "重新登入" in result.alert_message              # stale remedy
+        assert "[CCDScheduledTasks]" in result.alert_message   # unconfirmed remedy
+        assert "meal-plan-cart" in result.alert_message
+
+    def test_the_remaining_cause_stays_tracked_after_the_latch_lifts(self):
+        state, _ = self._both_causes()
+        mod.mark_alerted(state, T("2026-08-22 10:06:00"))
+        confirm = ("2026-08-22 10:10:00 [info] [CCDScheduledTasks] "
+                   "Confirmed task run for: process-replies")
+        result = mod.evaluate(state, mod.parse_events([confirm]),
+                              now=T("2026-08-22 10:11:00"))
+        assert result.incident_active is True
+        assert state["active_incident"]["causes"] == [mod.CAUSE_UNCONFIRMED]
+        assert "meal-plan-cart" in state["active_incident"]["affected_tasks"]
+
+    def test_blind_and_stale_together_both_render(self):
+        state = {}
+        result = mod.evaluate(state, mod.parse_events([self.STALE]),
+                              now=T("2026-08-22 10:06:00"), blocked_reason="讀不到狀態檔")
+        assert "讀不到狀態檔" in result.alert_message
+        assert "重新登入" in result.alert_message
+
+
+class TestSemanticStateValidation:
+    """Type-correct but meaningless state must be rejected, not merely survived.
+
+    Round-10 review [high]: timestamps were checked for being strings, not for
+    parsing; ``stale_open`` was not checked at all. Neither bad value raises, so
+    the round-9 quarantine net never fires — a pending spawn with an unparseable
+    timestamp simply never times out, and its miss is never reported.
+    """
+
+    def test_unparseable_pending_timestamp_is_rejected(self):
+        assert mod._state_is_usable(
+            {"pending_spawns": [{"task": "x", "ts": "not-a-timestamp"}]}) is False
+
+    def test_unparseable_incident_timestamp_is_rejected(self):
+        assert mod._state_is_usable(
+            {"active_incident": {"first_seen_at": "yesterday"}}) is False
+
+    def test_unparseable_open_failure_timestamp_is_rejected(self):
+        assert mod._state_is_usable(
+            {"active_incident": {"open_failures": {"x": "soonish"}}}) is False
+
+    def test_non_boolean_stale_open_is_rejected(self):
+        assert mod._state_is_usable({"active_incident": {"stale_open": "false"}}) is False
+
+    def test_boolean_cursor_values_are_rejected(self):
+        # bool is a subclass of int, so isinstance() alone lets True through
+        assert mod._state_is_usable({"log": {"inode": True, "offset": 0}}) is False
+        assert mod._state_is_usable({"log": {"inode": 3, "offset": False}}) is False
+
+    def test_well_formed_values_are_still_accepted(self):
+        assert mod._state_is_usable({
+            "log": {"inode": 3, "offset": 12},
+            "pending_spawns": [{"task": "x", "ts": "2026-08-22 10:00:00"}],
+            "active_incident": {"causes": ["session_stale_relogin"],
+                                "affected_tasks": ["x"],
+                                "stale_open": True,
+                                "first_seen_at": "2026-08-22 10:00:00",
+                                "last_alert_at": None,
+                                "open_failures": {"x": "2026-08-22 10:00:00"}},
+        }) is True
+
+    def test_a_malformed_timestamp_cannot_hide_a_missed_run(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps(
+            {"pending_spawns": [{"task": "process-replies", "ts": "not-a-timestamp"}]}),
+            encoding="utf-8")
+        log = tmp_path / "main.log"
+        stamp = dt.datetime.now() - dt.timedelta(minutes=120)
+        log.write_text(
+            f"{stamp.strftime('%Y-%m-%d %H:%M:%S')} [info] [CCDScheduledTasks] "
+            "Spawning new session for scheduled task process-replies "
+            "{ cronExpression: '0 12 * * *' }\n", encoding="utf-8")
+        sent = []
+        monkeypatch.setattr(mod, "send_notification",
+                            lambda message, _bin: (sent.append(message), True)[1])
+        monkeypatch.setattr(sys, "argv", [
+            "claude_scheduler_watchdog.py", "--log-file", str(log),
+            "--state-file", str(state_file), "--notify",
+        ])
+        assert mod.main() == 1
+        assert any("process-replies" in message for message in sent)
+        assert (tmp_path / "state.json.corrupt").exists()
+
+
 class TestFormatting:
     def test_stale_alert_carries_cause_and_fix(self):
         incident = {"causes": ["session_stale_relogin"],
