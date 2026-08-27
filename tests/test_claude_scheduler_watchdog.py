@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -51,6 +52,15 @@ CONFIRM_B = ("2026-08-22 09:30:00 [info] [CCDScheduledTasks] "
 
 def T(s):
     return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+
+
+def window_hours_for(oldest="2026-08-18 12:05:52"):
+    """Cold-start window wide enough to reach the historical incident fixture.
+
+    Derived from the fixture timestamp rather than hard-coded, so these tests do
+    not quietly start passing for the wrong reason as the fixture ages.
+    """
+    return int((dt.datetime.now() - T(oldest)).total_seconds() // 3600) + 24
 
 
 class TestParseEvents:
@@ -157,6 +167,9 @@ class TestEvaluate:
         assert result.alert_message is None
         assert result.recovery_message is not None
         assert "恢復" in result.recovery_message
+        # held open until the notice is delivered
+        assert state["active_incident"]["resolved_by"] is not None
+        mod.mark_recovered(state)
         assert state.get("active_incident") is None
 
     def test_no_recovery_notice_if_never_alerted(self):
@@ -317,6 +330,7 @@ class TestMainDeliveryGating:
         monkeypatch.setattr(sys, "argv", [
             "claude_scheduler_watchdog.py",
             "--log-file", str(log), "--state-file", str(state_file), "--notify",
+            "--bootstrap-window-hours", str(window_hours_for()),
         ])
         rc = mod.main()
         return rc, json.loads(state_file.read_text(encoding="utf-8"))
@@ -373,6 +387,7 @@ class TestPerTaskRecovery:
         result = mod.evaluate(state, mod.parse_events([CONFIRM_A]),
                               now=T("2026-08-22 09:41:00"))
         assert result.recovery_message is not None
+        mod.mark_recovered(state)
         assert state.get("active_incident") is None
 
     def test_stale_latch_still_recovers_globally(self):
@@ -387,6 +402,7 @@ class TestPerTaskRecovery:
         result = mod.evaluate(state, mod.parse_events([other_task]),
                               now=T("2026-08-19 09:00:00"))
         assert result.recovery_message is not None
+        mod.mark_recovered(state)
         assert state.get("active_incident") is None
 
     def test_failure_after_the_latch_survives_global_recovery(self):
@@ -443,10 +459,193 @@ class TestStatePersistence:
         monkeypatch.setattr(sys, "argv", [
             "claude_scheduler_watchdog.py",
             "--log-file", str(log), "--state-file", str(state_file), "--notify",
+            "--bootstrap-window-hours", str(window_hours_for()),
         ])
         assert mod.main() == 1  # incident still detected and alerted
         state = json.loads(state_file.read_text(encoding="utf-8"))
         assert state["active_incident"]["last_alert_at"] is not None
+
+
+RECOVER_LINE = ("2026-08-19 08:03:12 [info] [CCDScheduledTasks] "
+                "Confirmed task run for: daily-memory-sync")
+
+
+class TestRecoveryDeliveryGating:
+    """Clearing an incident discharges a notification obligation.
+
+    Round-3 review [high]: ``main()`` persists state even without ``--notify``,
+    and ``evaluate()`` dropped ``active_incident`` the moment it saw a resolving
+    confirm. A documented "check only" run therefore ate the only recovery event
+    and advanced the log offset, so no notifying run ever had anything to send.
+    """
+
+    def _alerted_then_resolved(self):
+        state = {}
+        mod.evaluate(state, mod.parse_events([SPAWN_LINE] + STALE_LINES),
+                     now=T("2026-08-18 13:00:00"))
+        mod.mark_alerted(state, T("2026-08-18 13:00:00"))
+        result = mod.evaluate(state, mod.parse_events([RECOVER_LINE]),
+                              now=T("2026-08-19 09:00:00"))
+        return state, result
+
+    def test_resolved_incident_is_kept_until_the_notice_is_delivered(self):
+        state, result = self._alerted_then_resolved()
+        assert result.recovery_message is not None
+        assert state.get("active_incident") is not None
+
+    def test_pending_recovery_survives_a_run_that_sent_nothing(self):
+        state, first = self._alerted_then_resolved()
+        again = mod.evaluate(state, [], now=T("2026-08-19 10:00:00"))
+        assert again.recovery_message == first.recovery_message
+
+    def test_mark_recovered_closes_it_for_good(self):
+        state, _ = self._alerted_then_resolved()
+        mod.mark_recovered(state)
+        assert state.get("active_incident") is None
+        assert mod.evaluate(state, [], now=T("2026-08-19 11:00:00")).recovery_message is None
+
+    def test_a_new_failure_cancels_a_pending_recovery(self):
+        state, _ = self._alerted_then_resolved()
+        broke_again = ("2026-08-19 10:15:00 [warn] [CCDScheduledTasks] "
+                       "Cleared stale pending dispatch for: meal-plan-cart")
+        result = mod.evaluate(state, mod.parse_events([broke_again]),
+                              now=T("2026-08-19 10:30:00"))
+        assert result.recovery_message is None
+        assert state["active_incident"].get("resolved_by") is None
+
+    def test_incident_that_was_never_paged_still_closes_silently(self):
+        state = {}
+        mod.evaluate(state, mod.parse_events(STALE_LINES), now=T("2026-08-18 13:00:00"))
+        result = mod.evaluate(state, mod.parse_events([NORMAL_CONFIRM]),
+                              now=T("2026-08-20 13:00:00"))
+        assert result.recovery_message is None
+        assert state.get("active_incident") is None
+
+
+class TestMainRecoveryGating:
+    @staticmethod
+    def _argv(log, state_file, notify):
+        argv = ["claude_scheduler_watchdog.py",
+                "--log-file", str(log), "--state-file", str(state_file),
+                "--bootstrap-window-hours", str(window_hours_for())]
+        if notify:
+            argv.append("--notify")
+        return argv
+
+    def test_check_only_run_does_not_consume_the_recovery(self, tmp_path, monkeypatch):
+        log = tmp_path / "main.log"
+        state_file = tmp_path / "state.json"
+        log.write_text("\n".join([SPAWN_LINE] + STALE_LINES) + "\n", encoding="utf-8")
+        sent = []
+
+        def capture(message, _notify_bin):
+            sent.append(message)
+            return True
+
+        monkeypatch.setattr(mod, "send_notification", capture)
+
+        monkeypatch.setattr(sys, "argv", self._argv(log, state_file, notify=True))
+        assert mod.main() == 1
+        assert len(sent) == 1  # the alert
+
+        with log.open("a", encoding="utf-8") as f:
+            f.write(RECOVER_LINE + "\n")
+
+        # documented diagnostic invocation: observes the recovery, sends nothing
+        monkeypatch.setattr(sys, "argv", self._argv(log, state_file, notify=False))
+        assert mod.main() == 0
+        assert len(sent) == 1
+
+        # the next hourly notifying run must still deliver it
+        monkeypatch.setattr(sys, "argv", self._argv(log, state_file, notify=True))
+        assert mod.main() == 0
+        assert len(sent) == 2
+        assert "恢復" in sent[1]
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        assert state.get("active_incident") is None
+
+
+class TestColdStartBootstrap:
+    """A fresh or quarantined state must not discard pre-rotation evidence.
+
+    Round-3 review [high]: ``read_new_lines`` only consulted rotated siblings
+    when a prior inode was stored, so after a fresh deploy — or the corrupt-state
+    quarantine added in round 2 — an incident whose evidence had already rotated
+    into ``main1.log`` was reconstructed as healthy.
+    """
+
+    @staticmethod
+    def _recent(mins_ago, body):
+        stamp = dt.datetime.now() - dt.timedelta(minutes=mins_ago)
+        return f"{stamp.strftime('%Y-%m-%d %H:%M:%S')} {body}"
+
+    def test_cold_start_drains_recent_rotated_siblings(self, tmp_path):
+        (tmp_path / "main1.log").write_text("rotated line\n", encoding="utf-8")
+        main = tmp_path / "main.log"
+        main.write_text("current line\n", encoding="utf-8")
+        lines, _ = mod.read_new_lines(
+            main, {}, bootstrap_since=dt.datetime.now() - dt.timedelta(hours=24))
+        assert lines == ["rotated line", "current line"]
+
+    def test_cold_start_skips_siblings_older_than_the_window(self, tmp_path):
+        rotated = tmp_path / "main1.log"
+        rotated.write_text("ancient line\n", encoding="utf-8")
+        old = (dt.datetime.now() - dt.timedelta(days=9)).timestamp()
+        os.utime(rotated, (old, old))
+        main = tmp_path / "main.log"
+        main.write_text("current line\n", encoding="utf-8")
+        lines, _ = mod.read_new_lines(
+            main, {}, bootstrap_since=dt.datetime.now() - dt.timedelta(hours=24))
+        assert lines == ["current line"]
+
+    def test_warm_start_does_not_re_read_siblings(self, tmp_path):
+        main = tmp_path / "main.log"
+        main.write_text("first\n", encoding="utf-8")
+        _, st = mod.read_new_lines(main, {})
+        (tmp_path / "main1.log").write_text("rotated line\n", encoding="utf-8")
+        with main.open("a", encoding="utf-8") as f:
+            f.write("second\n")
+        lines, _ = mod.read_new_lines(
+            main, st, bootstrap_since=dt.datetime.now() - dt.timedelta(hours=24))
+        assert lines == ["second"]
+
+    def test_main_sees_an_incident_whose_evidence_already_rotated(self, tmp_path, monkeypatch):
+        (tmp_path / "main1.log").write_text("\n".join([
+            self._recent(120, "[info] [CCDScheduledTasks] Spawning new session for "
+                              "scheduled task process-replies { cronExpression: '0 12 * * *' }"),
+            self._recent(119, "[error] Cannot start session local_abc: Unable to start "
+                              "session. Sign in again to continue: session_stale_relogin"),
+        ]) + "\n", encoding="utf-8")
+        main = tmp_path / "main.log"
+        main.write_text(
+            self._recent(60, "[info] [process-memory] trigger=interval tree_rss_sum=369MB") + "\n",
+            encoding="utf-8")
+        state_file = tmp_path / "state.json"
+        sent = []
+        monkeypatch.setattr(mod, "send_notification",
+                            lambda message, _bin: (sent.append(message), True)[1])
+        monkeypatch.setattr(sys, "argv", [
+            "claude_scheduler_watchdog.py",
+            "--log-file", str(main), "--state-file", str(state_file), "--notify",
+        ])
+        assert mod.main() == 1
+        assert len(sent) == 1
+        assert "session_stale_relogin" in sent[0]
+
+    def test_cold_start_ignores_events_older_than_the_window(self, tmp_path, monkeypatch):
+        # a months-old incident already in main.log must not page on first run
+        main = tmp_path / "main.log"
+        main.write_text("\n".join([SPAWN_LINE] + STALE_LINES) + "\n", encoding="utf-8")
+        state_file = tmp_path / "state.json"
+        sent = []
+        monkeypatch.setattr(mod, "send_notification",
+                            lambda message, _bin: (sent.append(message), True)[1])
+        monkeypatch.setattr(sys, "argv", [
+            "claude_scheduler_watchdog.py",
+            "--log-file", str(main), "--state-file", str(state_file), "--notify",
+        ])
+        assert mod.main() == 0
+        assert sent == []
 
 
 class TestFormatting:

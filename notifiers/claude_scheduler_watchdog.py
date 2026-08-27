@@ -115,7 +115,9 @@ def _read_complete_lines(path: Path, start: int) -> "tuple[list[str], int]":
     return consumed.decode("utf-8", errors="replace").splitlines(), start + len(consumed)
 
 
-def read_new_lines(log_path: Path, log_state: "dict[str, Any]") -> "tuple[list[str], dict[str, Any]]":
+def read_new_lines(log_path: Path, log_state: "dict[str, Any]",
+                   bootstrap_since: Optional[dt.datetime] = None,
+                   ) -> "tuple[list[str], dict[str, Any]]":
     stored_ino = log_state.get("inode")
     stored_off = log_state.get("offset", 0)
     lines: "list[str]" = []
@@ -141,6 +143,24 @@ def read_new_lines(log_path: Path, log_state: "dict[str, Any]") -> "tuple[list[s
                     tail, _ = _read_complete_lines(sibling, stored_off)
                     lines.extend(tail)
                     break
+        elif bootstrap_since is not None:
+            # Cold start — a fresh deploy, or state we just quarantined as
+            # corrupt. An incident already under way may have left its evidence
+            # in a file that has since rotated, so read the siblings that are
+            # still recent enough to matter. Oldest first, so the merged stream
+            # stays in chronological order.
+            pattern = f"{log_path.stem}[0-9]*{log_path.suffix}"
+            recent: "list[tuple[float, Path]]" = []
+            for sibling in log_path.parent.glob(pattern):
+                try:
+                    sib_st = sibling.stat()
+                except OSError:
+                    continue
+                if dt.datetime.fromtimestamp(sib_st.st_mtime) >= bootstrap_since:
+                    recent.append((sib_st.st_mtime, sibling))
+            for _, sibling in sorted(recent, key=lambda item: item[0]):
+                sib_lines, _ = _read_complete_lines(sibling, 0)
+                lines.extend(sib_lines)
 
     new_lines, new_off = _read_complete_lines(log_path, start)
     lines.extend(new_lines)
@@ -273,13 +293,28 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
             open_failures = {task: ts for task, ts in open_failures.items()
                              if ts is not None and ts > stale_at}
 
-    recovery_message = None
     if not open_failures and not stale_open:
-        if incident is not None:
-            if incident.get("last_alert_at") and last_confirm is not None:
-                recovery_message = format_recovery(incident, last_confirm)
+        if incident is None:
+            return EvalResult(None, None, incident_active=False)
+        resolver = incident.get("resolved_by")
+        if last_confirm is not None and last_confirm.ts is not None:
+            resolver = {"task": last_confirm.task, "ts": fmt_ts(last_confirm.ts)}
+        if not incident.get("last_alert_at") or resolver is None:
+            # Nothing was ever paged, so no notice is owed and the incident can
+            # simply close.
             state.pop("active_incident", None)
-        return EvalResult(None, recovery_message, incident_active=False)
+            return EvalResult(None, None, incident_active=False)
+        # A notice IS owed. Hold the incident open until a notifying run actually
+        # delivers it — otherwise a documented check-only run consumes the only
+        # recovery event, advances the log offset, and the notice is lost.
+        incident["resolved_by"] = resolver
+        incident["open_failures"] = {}
+        incident["stale_open"] = False
+        state["active_incident"] = incident
+        resolving_confirm = LogEvent("confirm", parse_ts(resolver.get("ts")),
+                                     resolver.get("task"))
+        return EvalResult(None, format_recovery(incident, resolving_confirm),
+                          incident_active=False)
 
     if incident is None:
         incident = {
@@ -301,6 +336,8 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
     incident["open_failures"] = {task: fmt_ts(ts) for task, ts in open_failures.items()}
     incident["stale_open"] = stale_open
     incident["stale_last_at"] = fmt_ts(stale_at)
+    # Something is broken again, so any recovery notice still queued is void.
+    incident["resolved_by"] = None
     prev_failure = parse_ts(incident.get("last_failure_at"))
     if window_last_failure is not None and (prev_failure is None
                                             or window_last_failure > prev_failure):
@@ -330,6 +367,15 @@ def mark_alerted(state: "dict[str, Any]", now: dt.datetime) -> None:
         return
     incident["last_alert_at"] = fmt_ts(now)
     incident["alerted_tasks"] = incident["affected_tasks"]
+
+
+def mark_recovered(state: "dict[str, Any]") -> None:
+    """Close a resolved incident once its recovery notice actually went out.
+
+    The mirror of ``mark_alerted``: a state transition that discharges a
+    notification obligation is only committed after the notification lands.
+    """
+    state.pop("active_incident", None)
 
 
 def load_json(path: Path) -> "dict[str, Any]":
@@ -400,16 +446,27 @@ def main() -> int:
                         default=Path(os.environ.get("NOTIFY_DM_BIN", DEFAULT_NOTIFY_DM_BIN)))
     parser.add_argument("--pending-timeout-min", type=int, default=15,
                         help="Minutes a spawn may stay unconfirmed before it counts as failed")
+    parser.add_argument("--bootstrap-window-hours", type=int, default=24,
+                        help="On a cold start (no prior state), how far back log "
+                             "evidence — including rotated files — still counts")
     parser.add_argument("--cooldown-hours", type=int, default=12,
                         help="Minimum hours between same-cause alerts (new tasks re-alert)")
     parser.add_argument("--json", action="store_true", help="Print machine-readable result")
     args = parser.parse_args()
 
     try:
-        state = load_json(args.state_file)
-        lines, log_state = read_new_lines(args.log_file, state.get("log", {}))
-        events = parse_events(lines)
         now = dt.datetime.now()
+        state = load_json(args.state_file)
+        cold_start = not state.get("log")
+        bootstrap_since = now - dt.timedelta(hours=args.bootstrap_window_hours)
+        lines, log_state = read_new_lines(
+            args.log_file, state.get("log", {}),
+            bootstrap_since=bootstrap_since if cold_start else None)
+        events = parse_events(lines)
+        if cold_start:
+            # A cold start reads whole files, so bound it by age: report what is
+            # happening now, not an incident that was resolved months ago.
+            events = [ev for ev in events if ev.ts is None or ev.ts >= bootstrap_since]
         result = evaluate(state, events, now,
                           pending_timeout_min=args.pending_timeout_min,
                           cooldown_hours=args.cooldown_hours)
@@ -424,6 +481,7 @@ def main() -> int:
                     notified = True
             if result.recovery_message:
                 if send_notification(result.recovery_message, args.notify_bin):
+                    mark_recovered(state)
                     notified = True
 
         state["log"] = log_state
