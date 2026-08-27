@@ -135,6 +135,68 @@ LaunchAgents already call, so no plist changes are needed.
 | `slickdeals_deliver.sh` | `slickdeals-monitor` | `notify-dm` |
 | `weekly_offers_deliver.sh` | `weekly-standard-offers` | `notify-dm` + `notify-group-couple` |
 | `openclaw_channel_watchdog.py` | `channel-watchdog` | `notify-dm` on unhealthy channels |
+| `claude_scheduler_watchdog.py` | `claude-scheduler-watchdog` | `notify-dm` on scheduled-task spawn failures |
+
+## Claude scheduler watchdog
+
+Issue [#22](https://github.com/cathyyul/notify-shim/issues/22): when the Claude
+desktop login gets too old, spawning local scheduled-task sessions fails with
+`session_stale_relogin` and every local routine dies silently (2026-08-18/19:
+all 7 routines down for ~20h). The watchdog tails
+`~/Library/Logs/Claude/main.log` (rotation-aware, incremental via a state file)
+hourly and alerts through `notify-dm` when it sees `session_stale_relogin` or a
+`Spawning new session for scheduled task <X>` with no matching
+`Confirmed task run for: <X>` within 15 minutes. Alerts carry the cause, the fix
+(re-login to the Claude desktop app on the Mac mini), and the affected task
+list; same-cause alerts are deduped for 12h but a newly affected task re-alerts,
+and the first confirmed run after an alert sends a recovery notice.
+
+Not being able to look is itself an incident. If the log or the state file
+cannot be read, or a rotation leaves a gap the watchdog cannot prove it read
+through, it alerts saying so rather than reporting healthy — a watchdog that is
+quietly blind is the failure this tool exists to catch. Alerts and recovery
+notices are only recorded as sent once `notify-dm` accepts them, so a failed
+send is retried on the next run instead of being silenced by the cooldown.
+
+### Known limitations
+
+These are accepted, not overlooked. The watchdog covers the failure that
+actually happened (a silent 20h outage) and deliberately stops short of proving
+every edge; each was adjudicated on issue #22 rather than hardened further.
+
+- **Accounting is per task, not per invocation.** The log carries no invocation
+  id, so if a task spawns twice inside the 15-minute window and only the later
+  run confirms, the earlier missed run is not reported. The scheduled routines
+  are daily or hourly with a single in-flight invocation, so this needs a manual
+  rerun or a catch-up dispatch to overlap the original schedule. Inferring
+  invocation identity from second-resolution timestamps was tried and removed:
+  it produced more bugs than it caught.
+- **A gap in the middle of the rotation chain is not detected.** If the
+  generation the cursor points at still exists, the reader walks the newer
+  generations it can find. Should an intermediate `mainN.log` be deleted, its
+  events are skipped without the run being marked blind. A missing *resume*
+  generation is still detected and does block.
+- **A stale-login line and a `Confirmed` line in the same second may still
+  alert.** Per-task failures resolve in log order, but the global latch check
+  compares timestamps, so recovery proven within the same second can page once
+  before the next scan clears it.
+- **A rotation landing between the `stat()` and the read binds the cursor to
+  the wrong file.** The live log is statted once and reopened by pathname, so a
+  rotation inside that window returns the new file's offset paired with the old
+  file's inode, and the next run resumes at an unrelated position. The window is
+  microseconds against a rotation every few days, so this is left as a race
+  rather than fixed by re-opening and `fstat`ing.
+- **An unwritable state file re-sends alerts every hour.** Delivery happens
+  before persistence and a failed `save_json` is only logged, so a run that
+  cannot save its bookkeeping repeats the same alert on the next tick. Dedup
+  would need an idempotency key that `notify-dm` records independently. Noisy is
+  the intended direction to fail in — this watchdog exists because silence is
+  the worse outcome.
+
+```sh
+python3 notifiers/claude_scheduler_watchdog.py --json      # check only
+python3 notifiers/claude_scheduler_watchdog.py --notify    # alert via notify-dm
+```
 
 ## OpenClaw channel watchdog
 
