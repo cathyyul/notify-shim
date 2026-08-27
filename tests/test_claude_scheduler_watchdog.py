@@ -812,6 +812,136 @@ class TestPendingSpawnGranularity:
         assert result.alert_message is None
 
 
+class TestSameTaskFailureAccounting:
+    """Within one scan window a task can fail, recover, and fail again.
+
+    Round-5 review [high]: ``note_failure`` kept only the *first* failure per
+    task, so the resolution pass compared a later confirm against that stale
+    timestamp and cleared a task that had broken again since.
+    """
+
+    FAIL_1000 = ("2026-08-22 10:00:00 [warn] [CCDScheduledTasks] "
+                 "Cleared stale pending dispatch for: process-replies")
+    CONFIRM_1005 = ("2026-08-22 10:05:00 [info] [CCDScheduledTasks] "
+                    "Confirmed task run for: process-replies")
+    FAIL_1010 = ("2026-08-22 10:10:00 [warn] [CCDScheduledTasks] "
+                 "Cleared stale pending dispatch for: process-replies")
+    CONFIRM_1015 = ("2026-08-22 10:15:00 [info] [CCDScheduledTasks] "
+                    "Confirmed task run for: process-replies")
+
+    def test_failure_after_a_confirm_in_the_same_window_survives(self):
+        state = {}
+        result = mod.evaluate(state, mod.parse_events(
+            [self.FAIL_1000, self.CONFIRM_1005, self.FAIL_1010]),
+            now=T("2026-08-22 10:30:00"))
+        assert result.incident_active is True
+        assert result.alert_message is not None
+        assert "process-replies" in result.alert_message
+
+    def test_confirm_after_the_newest_failure_still_resolves(self):
+        state = {}
+        result = mod.evaluate(state, mod.parse_events(
+            [self.FAIL_1000, self.CONFIRM_1005, self.FAIL_1010, self.CONFIRM_1015]),
+            now=T("2026-08-22 10:30:00"))
+        assert result.incident_active is False
+        assert result.alert_message is None
+
+    def test_repeated_failures_before_a_confirm_all_clear(self):
+        state = {}
+        result = mod.evaluate(state, mod.parse_events(
+            [self.FAIL_1000, self.FAIL_1010, self.CONFIRM_1015]),
+            now=T("2026-08-22 10:30:00"))
+        assert result.incident_active is False
+
+    def test_confirm_sharing_the_spawn_second_still_resolves_it(self):
+        """A spawn and its confirm routinely land in the same second.
+
+        Caught by re-running the real-log regression after switching
+        ``note_failure`` to keep the newest failure: a spawn that aged out in one
+        window recorded its own timestamp, and the confirm arriving in the next
+        window carried that identical second, so a strict ``>`` left the task
+        open forever. Real case: process-replies spawn/confirm at 12:06:15 on
+        2026-08-19, which stalled the recovery notice for the whole incident.
+        """
+        state = {}
+        mod.evaluate(state, mod.parse_events([NORMAL_SPAWN]), now=T("2026-08-20 13:00:00"))
+        assert state["active_incident"]["open_failures"] == {
+            "process-replies": "2026-08-20 12:06:18"}
+        result = mod.evaluate(state, mod.parse_events([NORMAL_CONFIRM]),
+                              now=T("2026-08-20 13:30:00"))
+        assert result.incident_active is False
+
+    def test_a_carried_over_failure_is_not_revived_by_an_old_timestamp(self):
+        state = {}
+        mod.evaluate(state, mod.parse_events([self.FAIL_1000]), now=T("2026-08-22 10:02:00"))
+        mod.mark_alerted(state, T("2026-08-22 10:02:00"))
+        result = mod.evaluate(state, mod.parse_events([self.CONFIRM_1005]),
+                              now=T("2026-08-22 10:30:00"))
+        assert result.recovery_message is not None
+
+
+class TestStateFileFailuresAreLoud:
+    """The state file must never be able to switch the watchdog off quietly.
+
+    Round-5 review: the round-2 quarantine only covered decode errors, so a bad
+    chmod made ``load_json`` raise straight into ``main``'s catch-all — exit 2,
+    stderr into a log nobody reads, no DM. Same silence the tool exists to break,
+    so this is treated as P1 rather than the reviewer's [medium].
+    """
+
+    @staticmethod
+    def _recent(mins_ago, body):
+        stamp = dt.datetime.now() - dt.timedelta(minutes=mins_ago)
+        return f"{stamp.strftime('%Y-%m-%d %H:%M:%S')} {body}"
+
+    def _log(self, tmp_path):
+        log = tmp_path / "main.log"
+        log.write_text("\n".join([
+            self._recent(120, "[info] [CCDScheduledTasks] Spawning new session for "
+                              "scheduled task process-replies { cronExpression: '0 12 * * *' }"),
+            self._recent(119, "[error] Cannot start session local_abc: Unable to start "
+                              "session. Sign in again to continue: session_stale_relogin"),
+        ]) + "\n", encoding="utf-8")
+        return log
+
+    def test_unreadable_state_file_alerts_instead_of_exiting_two(self, tmp_path, monkeypatch):
+        log = self._log(tmp_path)
+
+        def denied(_path):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(mod, "load_json", denied)
+        sent = []
+        monkeypatch.setattr(mod, "send_notification",
+                            lambda message, _bin: (sent.append(message), True)[1])
+        monkeypatch.setattr(sys, "argv", [
+            "claude_scheduler_watchdog.py", "--log-file", str(log),
+            "--state-file", str(tmp_path / "state.json"), "--notify",
+        ])
+        assert mod.main() == 1
+        assert sent
+        assert "狀態檔" in sent[0]
+        # the log itself read fine, so the remedy must not point at main.log
+        assert "確認 ~/Library/Logs/Claude/main.log" not in sent[0]
+
+    def test_unwritable_state_file_does_not_mask_the_incident(self, tmp_path, monkeypatch):
+        log = self._log(tmp_path)
+
+        def denied(*_args, **_kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(mod, "save_json", denied)
+        sent = []
+        monkeypatch.setattr(mod, "send_notification",
+                            lambda message, _bin: (sent.append(message), True)[1])
+        monkeypatch.setattr(sys, "argv", [
+            "claude_scheduler_watchdog.py", "--log-file", str(log),
+            "--state-file", str(tmp_path / "state.json"), "--notify",
+        ])
+        assert mod.main() == 1
+        assert any("session_stale_relogin" in message for message in sent)
+
+
 class TestFormatting:
     def test_stale_alert_carries_cause_and_fix(self):
         incident = {"causes": ["session_stale_relogin"],

@@ -213,11 +213,11 @@ def format_alert(incident: "dict[str, Any]") -> str:
     lines = ["⚠️ Claude 排程 watchdog：本機 scheduled-task 排程異常"]
     if CAUSE_BLIND in causes:
         lines.append(
-            "原因：watchdog 讀不到排程日誌，這段期間無法判斷排程是否正常"
+            "原因：watchdog 這段期間無法觀測排程狀態，不知道排程是不是正常"
             f"——{incident.get('blind_reason')}")
         lines.append(
-            "修法：確認 ~/Library/Logs/Claude/main.log 存在且可讀；"
-            "Claude desktop app 沒在跑就不會產生日誌。")
+            "修法：確認上述檔案存在且可讀（排程日誌要 Claude desktop app 在跑才會產生；"
+            "狀態檔則多半是權限或磁碟問題）。")
     if CAUSE_STALE in causes:
         lines.append(
             "原因：Claude desktop app 登入過期（session_stale_relogin），"
@@ -279,8 +279,14 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
 
     def note_failure(task: Optional[str], ts: Optional[dt.datetime]) -> None:
         nonlocal window_first_failure, window_last_failure
-        if task is not None and task not in failed:
-            failed[task] = ts
+        if task is not None:
+            # Keep the NEWEST failure per task. Keeping the first one let the
+            # resolution pass below compare a later confirm against a stale
+            # timestamp and clear a task that had broken again since — one scan
+            # window can hold fail → confirm → fail for the same task.
+            prev = failed.get(task)
+            if task not in failed or (ts is not None and (prev is None or ts > prev)):
+                failed[task] = ts
         if ts is not None:
             if window_first_failure is None or ts < window_first_failure:
                 window_first_failure = ts
@@ -339,7 +345,11 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
     for task in list(open_failures):
         confirmed_at = confirms.get(task)
         failed_at = open_failures[task]
-        if confirmed_at is not None and (failed_at is None or confirmed_at > failed_at):
+        # ``>=`` because a spawn and its confirm routinely land in the same
+        # second: if the spawn aged out in an earlier window, its confirm
+        # arriving later carries that identical timestamp and must still clear
+        # it, or the task stays open forever.
+        if confirmed_at is not None and (failed_at is None or confirmed_at >= failed_at):
             del open_failures[task]
 
     # A stale-login latch blocks every spawn, so any confirm after the last
@@ -525,7 +535,15 @@ def main() -> int:
 
     try:
         now = dt.datetime.now()
-        state = load_json(args.state_file)
+        state_problem = None
+        try:
+            state = load_json(args.state_file)
+        except OSError as exc:
+            # A bad chmod or a transient FS error must not switch the watchdog
+            # off. Carry on with empty state and report the blindness — noisy
+            # beats silent, which is the whole point of this tool.
+            state = {}
+            state_problem = f"無法讀取狀態檔 {args.state_file}：{exc}"
         bootstrap_since = now - dt.timedelta(hours=args.bootstrap_window_hours)
         read = read_new_lines(args.log_file, state.get("log"),
                               bootstrap_since=bootstrap_since)
@@ -534,10 +552,12 @@ def main() -> int:
             # A cold start reads whole files, so bound it by age: report what is
             # happening now, not an incident that was resolved months ago.
             events = [ev for ev in events if ev.ts is None or ev.ts >= bootstrap_since]
+        blocked_reason = "；".join(
+            reason for reason in (state_problem, read.blocked_reason) if reason) or None
         result = evaluate(state, events, now,
                           pending_timeout_min=args.pending_timeout_min,
                           cooldown_hours=args.cooldown_hours,
-                          blocked_reason=read.blocked_reason)
+                          blocked_reason=blocked_reason)
 
         notified = False
         if args.notify:
@@ -564,9 +584,14 @@ def main() -> int:
             "events": len(events),
             "notified": notified,
         }
-        if read.blocked_reason:
-            state["last_result"]["blocked"] = read.blocked_reason
-        save_json(args.state_file, state)
+        if blocked_reason:
+            state["last_result"]["blocked"] = blocked_reason
+        try:
+            save_json(args.state_file, state)
+        except OSError as exc:
+            # The alert already went out above; losing the bookkeeping must not
+            # turn a reported incident into an opaque exit 2.
+            print(f"state: 無法寫入 {args.state_file}：{exc}", file=sys.stderr)
 
         payload = dict(state["last_result"])
         if result.alert_message:
