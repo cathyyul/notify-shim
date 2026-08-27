@@ -503,12 +503,22 @@ def _state_is_usable(state: Any) -> bool:
     def wrong(container: "dict[str, Any]", key: str, kind: type) -> bool:
         return key in container and not isinstance(container[key], kind)
 
+    def optional_text(value: Any) -> bool:
+        return value is None or isinstance(value, str)
+
     if not isinstance(state, dict):
         return False
     if wrong(state, "log", dict) or wrong(state, "pending_spawns", list):
         return False
+    log = state.get("log") or {}
+    if log.get("inode") is not None and not isinstance(log["inode"], int):
+        return False
+    if "offset" in log and (not isinstance(log["offset"], int) or log["offset"] < 0):
+        return False
     for row in state.get("pending_spawns") or []:
         if not isinstance(row, dict) or not isinstance(row.get("task"), str):
+            return False
+        if not optional_text(row.get("ts")):
             return False
     incident = state.get("active_incident")
     if "active_incident" in state and incident is not None:
@@ -517,9 +527,21 @@ def _state_is_usable(state: Any) -> bool:
         for key in ("causes", "affected_tasks", "alerted_tasks", "alerted_causes"):
             if wrong(incident, key, list):
                 return False
+            if not all(isinstance(item, str) for item in incident.get(key) or []):
+                return False
+        for key in ("first_seen_at", "last_alert_at", "last_failure_at",
+                    "stale_last_at", "blind_reason"):
+            if not optional_text(incident.get(key)):
+                return False
         for key in ("open_failures", "resolved_by"):
             if key in incident and incident[key] is not None \
                     and not isinstance(incident[key], dict):
+                return False
+        for task, ts in (incident.get("open_failures") or {}).items():
+            if not isinstance(task, str) or not optional_text(ts):
+                return False
+        for value in (incident.get("resolved_by") or {}).values():
+            if not optional_text(value):
                 return False
     return True
 
@@ -570,7 +592,7 @@ def send_notification(message: str, notify_bin: Path) -> bool:
         return False
 
 
-def main() -> int:
+def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Watch Claude scheduled-task health via the desktop app main.log.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -591,77 +613,99 @@ def main() -> int:
     parser.add_argument("--cooldown-hours", type=int, default=12,
                         help="Minimum hours between same-cause alerts (new tasks re-alert)")
     parser.add_argument("--json", action="store_true", help="Print machine-readable result")
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    try:
-        now = dt.datetime.now()
-        state_problem = None
+
+def _run(args: argparse.Namespace, state_problem: Optional[str] = None,
+         use_state: bool = True) -> int:
+    now = dt.datetime.now()
+    state: "dict[str, Any]" = {}
+    if use_state:
         try:
             state = load_json(args.state_file)
         except OSError as exc:
             # A bad chmod or a transient FS error must not switch the watchdog
             # off. Carry on with empty state and report the blindness — noisy
             # beats silent, which is the whole point of this tool.
-            state = {}
             state_problem = f"無法讀取狀態檔 {args.state_file}：{exc}"
-        bootstrap_since = now - dt.timedelta(hours=args.bootstrap_window_hours)
-        read = read_new_lines(args.log_file, state.get("log"),
-                              bootstrap_since=bootstrap_since)
-        events = parse_events(read.lines)
-        if read.cold:
-            # A cold start reads whole files, so bound it by age: report what is
-            # happening now, not an incident that was resolved months ago.
-            events = [ev for ev in events if ev.ts is None or ev.ts >= bootstrap_since]
-        blocked_reason = "；".join(
-            reason for reason in (state_problem, read.blocked_reason) if reason) or None
-        result = evaluate(state, events, now,
-                          pending_timeout_min=args.pending_timeout_min,
-                          cooldown_hours=args.cooldown_hours,
-                          blocked_reason=blocked_reason)
+    bootstrap_since = now - dt.timedelta(hours=args.bootstrap_window_hours)
+    read = read_new_lines(args.log_file, state.get("log"),
+                          bootstrap_since=bootstrap_since)
+    events = parse_events(read.lines)
+    if read.cold:
+        # A cold start reads whole files, so bound it by age: report what is
+        # happening now, not an incident that was resolved months ago.
+        events = [ev for ev in events if ev.ts is None or ev.ts >= bootstrap_since]
+    blocked_reason = "；".join(
+        reason for reason in (state_problem, read.blocked_reason) if reason) or None
+    result = evaluate(state, events, now,
+                      pending_timeout_min=args.pending_timeout_min,
+                      cooldown_hours=args.cooldown_hours,
+                      blocked_reason=blocked_reason)
 
-        notified = False
-        if args.notify:
-            if result.alert_message:
-                # Consume the cooldown only on confirmed delivery; a failed
-                # send leaves the incident unalerted so the next run retries.
-                if send_notification(result.alert_message, args.notify_bin):
-                    mark_alerted(state, now)
-                    notified = True
-            if result.recovery_message:
-                if send_notification(result.recovery_message, args.notify_bin):
-                    mark_recovered(state)
-                    notified = True
-
-        if read.cursor is not None:
-            # Only advance the cursor when we actually read something. A run that
-            # saw nothing leaves the previous cursor alone rather than replacing
-            # it with a placeholder that the next run would mistake for a resume.
-            state["log"] = read.cursor
-        state["checked_at"] = now.strftime(TS_FORMAT)
-        state["last_result"] = {
-            "ok": not result.incident_active,
-            "scanned_lines": len(read.lines),
-            "events": len(events),
-            "notified": notified,
-        }
-        if blocked_reason:
-            state["last_result"]["blocked"] = blocked_reason
-        try:
-            save_json(args.state_file, state)
-        except OSError as exc:
-            # The alert already went out above; losing the bookkeeping must not
-            # turn a reported incident into an opaque exit 2.
-            print(f"state: 無法寫入 {args.state_file}：{exc}", file=sys.stderr)
-
-        payload = dict(state["last_result"])
+    notified = False
+    if args.notify:
         if result.alert_message:
-            payload["alert"] = result.alert_message
+            # Consume the cooldown only on confirmed delivery; a failed send
+            # leaves the incident unalerted so the next run retries.
+            if send_notification(result.alert_message, args.notify_bin):
+                mark_alerted(state, now)
+                notified = True
         if result.recovery_message:
-            payload["recovery"] = result.recovery_message
-        if args.json or result.incident_active:
-            print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return 1 if result.incident_active else 0
+            if send_notification(result.recovery_message, args.notify_bin):
+                mark_recovered(state)
+                notified = True
+
+    if read.cursor is not None:
+        # Only advance the cursor when we actually read something. A run that
+        # saw nothing leaves the previous cursor alone rather than replacing it
+        # with a placeholder that the next run would mistake for a resume.
+        state["log"] = read.cursor
+    state["checked_at"] = now.strftime(TS_FORMAT)
+    state["last_result"] = {
+        "ok": not result.incident_active,
+        "scanned_lines": len(read.lines),
+        "events": len(events),
+        "notified": notified,
+    }
+    if blocked_reason:
+        state["last_result"]["blocked"] = blocked_reason
+    try:
+        save_json(args.state_file, state)
+    except OSError as exc:
+        # The alert already went out above; losing the bookkeeping must not turn
+        # a reported incident into an opaque exit 2.
+        print(f"state: 無法寫入 {args.state_file}：{exc}", file=sys.stderr)
+
+    payload = dict(state["last_result"])
+    if result.alert_message:
+        payload["alert"] = result.alert_message
+    if result.recovery_message:
+        payload["recovery"] = result.recovery_message
+    if args.json or result.incident_active:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 1 if result.incident_active else 0
+
+
+def main() -> int:
+    args = _parse_args()
+    try:
+        return _run(args)
     except Exception as exc:
+        # The persisted state is the only input we are free to throw away, and a
+        # file that never changes on its own would otherwise reproduce this exit
+        # 2 every hour in silence — the exact failure this tool exists to catch.
+        # _state_is_usable() enumerates the fields we know about, but no
+        # enumeration can be proven complete; this net does not depend on it
+        # being right. The cost when the fault lies elsewhere is a discarded
+        # state file, which a cold start rebuilds.
+        if args.state_file.exists():
+            _quarantine_state(args.state_file, f"使用時發生例外：{exc}")
+            try:
+                return _run(args, use_state=False,
+                            state_problem=f"狀態檔無法使用、已隔離：{exc}")
+            except Exception as retry_exc:
+                exc = retry_exc
         print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False),
               file=sys.stderr)
         return 2

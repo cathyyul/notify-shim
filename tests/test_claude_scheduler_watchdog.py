@@ -1197,6 +1197,80 @@ class TestStateShapeValidation:
         assert mod.main() == 0  # not the opaque exit 2
 
 
+class TestMalformedNestedState:
+    """No state file may cost the watchdog its voice, whatever is inside it.
+
+    Round-9 review [high]: the round-8 shape check validated container types but
+    not the scalars actually consumed, so ``{"log": {"offset": "0"}}`` passed and
+    then ``_read_log`` compared a str with an int — exit 2, no DM, hourly, from a
+    file that never changes on its own.
+
+    Enumerating fields is necessary but cannot be sufficient — nine rounds have
+    shown that a partly applied invariant gets found. So the last test here
+    covers the structural net: whatever slips past validation, using the state
+    must degrade to a clean start rather than silence.
+    """
+
+    @staticmethod
+    def _recent(mins_ago, body):
+        stamp = dt.datetime.now() - dt.timedelta(minutes=mins_ago)
+        return f"{stamp.strftime('%Y-%m-%d %H:%M:%S')} {body}"
+
+    def _run_with(self, tmp_path, monkeypatch, payload):
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps(payload), encoding="utf-8")
+        log = tmp_path / "main.log"
+        log.write_text("\n".join([
+            self._recent(120, "[info] [CCDScheduledTasks] Spawning new session for "
+                              "scheduled task process-replies { cronExpression: '0 12 * * *' }"),
+            self._recent(119, "[error] Cannot start session local_abc: Unable to start "
+                              "session. Sign in again to continue: session_stale_relogin"),
+        ]) + "\n", encoding="utf-8")
+        sent = []
+        monkeypatch.setattr(mod, "send_notification",
+                            lambda message, _bin: (sent.append(message), True)[1])
+        monkeypatch.setattr(sys, "argv", [
+            "claude_scheduler_watchdog.py", "--log-file", str(log),
+            "--state-file", str(state_file), "--notify",
+        ])
+        return mod.main(), sent
+
+    def test_string_offset_still_reports(self, tmp_path, monkeypatch):
+        rc, sent = self._run_with(tmp_path, monkeypatch, {"log": {"inode": 1, "offset": "0"}})
+        assert rc == 1
+        assert sent
+
+    def test_numeric_pending_timestamp_still_reports(self, tmp_path, monkeypatch):
+        rc, sent = self._run_with(
+            tmp_path, monkeypatch,
+            {"pending_spawns": [{"task": "process-replies", "ts": 12345}]})
+        assert rc == 1
+        assert sent
+
+    def test_numeric_open_failure_value_still_reports(self, tmp_path, monkeypatch):
+        rc, sent = self._run_with(tmp_path, monkeypatch, {"active_incident": {
+            "causes": [], "affected_tasks": [], "open_failures": {"process-replies": 5}}})
+        assert rc == 1
+        assert sent
+
+    def test_state_that_only_breaks_at_use_is_quarantined_and_retried(
+            self, tmp_path, monkeypatch):
+        # pretend validation passed: the net, not the enumeration, must save it
+        monkeypatch.setattr(mod, "_state_is_usable", lambda _state: True)
+        rc, sent = self._run_with(
+            tmp_path, monkeypatch,
+            {"pending_spawns": [{"task": "process-replies", "ts": 12345}]})
+        assert rc == 1
+        assert sent
+        assert (tmp_path / "state.json.corrupt").exists()
+
+    def test_a_genuine_bug_still_surfaces_as_exit_two(self, tmp_path, monkeypatch):
+        # the net must not swallow failures that have nothing to do with state
+        monkeypatch.setattr(mod, "parse_events", lambda _lines: 1 / 0)
+        rc, _sent = self._run_with(tmp_path, monkeypatch, {})
+        assert rc == 2
+
+
 class TestFormatting:
     def test_stale_alert_carries_cause_and_fix(self):
         incident = {"causes": ["session_stale_relogin"],
