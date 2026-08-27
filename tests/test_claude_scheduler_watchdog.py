@@ -39,6 +39,15 @@ NORMAL_SPAWN = (
 )
 NORMAL_CONFIRM = "2026-08-20 12:06:18 [info] [CCDScheduledTasks] Confirmed task run for: process-replies"
 
+# One task times out while an unrelated one keeps running fine (no stale login).
+SPAWN_A = (
+    "2026-08-22 09:00:00 [info] [CCDScheduledTasks] Spawning new session for scheduled task "
+    "meal-plan-cart { cronExpression: '0 9 * * *', fireAt: undefined }"
+)
+CONFIRM_A = "2026-08-22 09:40:00 [info] [CCDScheduledTasks] Confirmed task run for: meal-plan-cart"
+CONFIRM_B = ("2026-08-22 09:30:00 [info] [CCDScheduledTasks] "
+             "Confirmed task run for: travel-concierge-update")
+
 
 def T(s):
     return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
@@ -324,6 +333,120 @@ class TestMainDeliveryGating:
         assert state["active_incident"]["last_alert_at"] is not None
         assert state["active_incident"]["alerted_tasks"] == ["process-replies"]
         assert state["last_result"]["notified"] is True
+
+
+class TestPerTaskRecovery:
+    """A confirm only clears the task it names — except for a stale-login latch.
+
+    Round-2 review [high]: recovery and fresh-incident suppression both keyed off
+    "any later confirm", so one healthy task could bury another task's timeout
+    and even trigger a false recovery notice.
+    """
+
+    def _timed_out_task(self, state):
+        mod.evaluate(state, mod.parse_events([SPAWN_A]), now=T("2026-08-22 09:01:00"))
+        return mod.evaluate(state, [], now=T("2026-08-22 09:20:00"))
+
+    def test_other_task_confirm_does_not_suppress_a_new_failure(self):
+        state = {}
+        mod.evaluate(state, mod.parse_events([SPAWN_A]), now=T("2026-08-22 09:01:00"))
+        # a different task confirms; meal-plan-cart is still unaccounted for
+        result = mod.evaluate(state, mod.parse_events([CONFIRM_B]),
+                              now=T("2026-08-22 09:31:00"))
+        assert result.alert_message is not None
+        assert "meal-plan-cart" in result.alert_message
+
+    def test_other_task_confirm_does_not_recover_a_task_specific_incident(self):
+        state = {}
+        assert self._timed_out_task(state).alert_message is not None
+        mod.mark_alerted(state, T("2026-08-22 09:20:00"))
+        result = mod.evaluate(state, mod.parse_events([CONFIRM_B]),
+                              now=T("2026-08-22 09:31:00"))
+        assert result.recovery_message is None
+        assert state.get("active_incident") is not None
+        assert state["active_incident"]["affected_tasks"] == ["meal-plan-cart"]
+
+    def test_same_task_confirm_resolves_its_own_failure(self):
+        state = {}
+        assert self._timed_out_task(state).alert_message is not None
+        mod.mark_alerted(state, T("2026-08-22 09:20:00"))
+        result = mod.evaluate(state, mod.parse_events([CONFIRM_A]),
+                              now=T("2026-08-22 09:41:00"))
+        assert result.recovery_message is not None
+        assert state.get("active_incident") is None
+
+    def test_stale_latch_still_recovers_globally(self):
+        # A stale-login latch blocks every spawn, so any confirm after it proves
+        # the latch is gone and the failures it caused were symptoms.
+        state = {}
+        mod.evaluate(state, mod.parse_events([SPAWN_LINE] + STALE_LINES),
+                     now=T("2026-08-18 13:00:00"))
+        mod.mark_alerted(state, T("2026-08-18 13:00:00"))
+        other_task = ("2026-08-19 08:03:12 [info] [CCDScheduledTasks] "
+                      "Confirmed task run for: daily-memory-sync")
+        result = mod.evaluate(state, mod.parse_events([other_task]),
+                              now=T("2026-08-19 09:00:00"))
+        assert result.recovery_message is not None
+        assert state.get("active_incident") is None
+
+    def test_failure_after_the_latch_survives_global_recovery(self):
+        state = {}
+        mod.evaluate(state, mod.parse_events([SPAWN_LINE] + STALE_LINES),
+                     now=T("2026-08-18 13:00:00"))
+        mod.mark_alerted(state, T("2026-08-18 13:00:00"))
+        # login is fixed (a task confirms) but another task broke afterwards
+        later_break = ("2026-08-19 08:30:00 [warn] [CCDScheduledTasks] "
+                       "Cleared stale pending dispatch for: meal-plan-cart")
+        recovered = ("2026-08-19 08:03:12 [info] [CCDScheduledTasks] "
+                     "Confirmed task run for: daily-memory-sync")
+        result = mod.evaluate(state, mod.parse_events([recovered, later_break]),
+                              now=T("2026-08-19 09:00:00"))
+        assert result.recovery_message is None
+        assert state.get("active_incident") is not None
+        assert "meal-plan-cart" in result.alert_message
+
+
+class TestStatePersistence:
+    """The state file must never be able to permanently blind the watchdog."""
+
+    def test_save_json_swaps_in_atomically(self, tmp_path, monkeypatch):
+        path = tmp_path / "state.json"
+        mod.save_json(path, {"generation": 1})
+        seen = []
+        real_replace = mod.os.replace
+
+        def spy(src, dst):
+            # the live file still holds the previous, parseable payload
+            assert json.loads(Path(dst).read_text(encoding="utf-8")) == {"generation": 1}
+            seen.append((src, dst))
+            real_replace(src, dst)
+
+        monkeypatch.setattr(mod.os, "replace", spy)
+        mod.save_json(path, {"generation": 2})
+        assert len(seen) == 1
+        assert json.loads(path.read_text(encoding="utf-8")) == {"generation": 2}
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["state.json"]
+
+    def test_corrupt_state_is_quarantined_not_fatal(self, tmp_path):
+        path = tmp_path / "state.json"
+        path.write_text('{"log": {"inode": 7, "off', encoding="utf-8")  # truncated write
+        assert mod.load_json(path) == {}
+        assert (tmp_path / "state.json.corrupt").exists()
+        assert not path.exists()
+
+    def test_main_survives_a_corrupt_state_file(self, tmp_path, monkeypatch):
+        state_file = tmp_path / "state.json"
+        state_file.write_text("{not json", encoding="utf-8")
+        log = tmp_path / "main.log"
+        log.write_text("\n".join([SPAWN_LINE] + STALE_LINES) + "\n", encoding="utf-8")
+        monkeypatch.setattr(mod, "send_notification", lambda *a, **k: True)
+        monkeypatch.setattr(sys, "argv", [
+            "claude_scheduler_watchdog.py",
+            "--log-file", str(log), "--state-file", str(state_file), "--notify",
+        ])
+        assert mod.main() == 1  # incident still detected and alerted
+        state = json.loads(state_file.read_text(encoding="utf-8"))
+        assert state["active_incident"]["last_alert_at"] is not None
 
 
 class TestFormatting:

@@ -192,8 +192,10 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
     incident: "Optional[dict[str, Any]]" = state.get("active_incident")
 
     failed: "dict[str, Optional[dt.datetime]]" = {}
+    confirms: "dict[str, dt.datetime]" = {}
     window_first_failure: Optional[dt.datetime] = None
     window_last_failure: Optional[dt.datetime] = None
+    window_stale_at: Optional[dt.datetime] = None
     last_confirm: Optional[LogEvent] = None
 
     def note_failure(task: Optional[str], ts: Optional[dt.datetime]) -> None:
@@ -212,12 +214,16 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
             pending.append({"task": ev.task, "ts": fmt_ts(ev.ts)})
         elif ev.kind == "confirm":
             pending = [p for p in pending if p["task"] != ev.task]
+            if ev.ts is not None and (ev.task not in confirms or ev.ts > confirms[ev.task]):
+                confirms[ev.task] = ev.ts
             last_confirm = ev
         elif ev.kind == "cleared":
             pending = [p for p in pending if p["task"] != ev.task]
             note_failure(ev.task, ev.ts)
         elif ev.kind == "stale":
             stale_seen = True
+            if ev.ts is not None and (window_stale_at is None or ev.ts > window_stale_at):
+                window_stale_at = ev.ts
             note_failure(None, ev.ts)
 
     still_pending: "list[dict[str, Any]]" = []
@@ -229,31 +235,51 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
             still_pending.append(p)
     state["pending_spawns"] = still_pending
 
-    # Recovery: a confirmed run after the newest failure evidence means the
-    # scheduler is spawning again (during a stale-login latch nothing confirms).
+    # Carry the unresolved failures forward, then resolve them against this
+    # window's confirms. A confirm is evidence about the task it names and
+    # nothing else, so a healthy task can no longer bury another task's timeout
+    # or fake a recovery for it.
+    open_failures: "dict[str, Optional[dt.datetime]]" = {}
+    stale_open = False
+    stale_at: Optional[dt.datetime] = None
+    if incident is not None:
+        for task, ts_str in (incident.get("open_failures") or {}).items():
+            open_failures[task] = parse_ts(ts_str)
+        stale_open = bool(incident.get("stale_open"))
+        stale_at = parse_ts(incident.get("stale_last_at"))
+    for task, ts in failed.items():
+        prev = open_failures.get(task)
+        if task not in open_failures or (ts is not None and (prev is None or ts > prev)):
+            open_failures[task] = ts
+    if stale_seen:
+        stale_open = True
+    if window_stale_at is not None and (stale_at is None or window_stale_at > stale_at):
+        stale_at = window_stale_at
+
+    for task in list(open_failures):
+        confirmed_at = confirms.get(task)
+        failed_at = open_failures[task]
+        if confirmed_at is not None and (failed_at is None or confirmed_at > failed_at):
+            del open_failures[task]
+
+    # A stale-login latch blocks every spawn, so any confirm after the last
+    # stale line proves the latch is gone and the failures it held down were
+    # symptoms of it. Anything that broke after the latch stands on its own.
+    newest_confirm = max(confirms.values()) if confirms else None
+    if stale_open and newest_confirm is not None and (stale_at is None
+                                                      or newest_confirm > stale_at):
+        stale_open = False
+        if stale_at is not None:
+            open_failures = {task: ts for task, ts in open_failures.items()
+                             if ts is not None and ts > stale_at}
+
     recovery_message = None
-    failure_now = stale_seen or bool(failed)
-    if incident is not None and last_confirm is not None:
-        confirm_ts = last_confirm.ts
-        recovered = (not failure_now
-                     or (confirm_ts is not None and window_last_failure is not None
-                         and confirm_ts > window_last_failure))
-        if recovered:
-            if incident.get("last_alert_at"):
+    if not open_failures and not stale_open:
+        if incident is not None:
+            if incident.get("last_alert_at") and last_confirm is not None:
                 recovery_message = format_recovery(incident, last_confirm)
             state.pop("active_incident", None)
-            return EvalResult(None, recovery_message, incident_active=False)
-
-    if incident is None and failure_now and last_confirm is not None:
-        confirm_ts = last_confirm.ts
-        if not (confirm_ts is not None and window_last_failure is not None
-                and window_last_failure > confirm_ts):
-            # Failure evidence followed by a confirm inside the same window:
-            # transient, already self-recovered before we ever alerted.
-            return EvalResult(None, None, incident_active=False)
-
-    if not failure_now:
-        return EvalResult(None, None, incident_active=incident is not None)
+        return EvalResult(None, recovery_message, incident_active=False)
 
     if incident is None:
         incident = {
@@ -264,14 +290,17 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
             "alerted_tasks": [],
             "last_failure_at": None,
         }
-    causes = set(incident.get("causes", []))
-    if stale_seen:
+    causes = set()
+    if stale_open:
         causes.add(CAUSE_STALE)
-    if any(task is not None for task in failed):
+    if open_failures:
         causes.add(CAUSE_UNCONFIRMED)
     incident["causes"] = sorted(causes)
     incident["affected_tasks"] = sorted(
-        set(incident.get("affected_tasks", [])) | set(failed))
+        set(incident.get("affected_tasks", [])) | set(open_failures))
+    incident["open_failures"] = {task: fmt_ts(ts) for task, ts in open_failures.items()}
+    incident["stale_open"] = stale_open
+    incident["stale_last_at"] = fmt_ts(stale_at)
     prev_failure = parse_ts(incident.get("last_failure_at"))
     if window_last_failure is not None and (prev_failure is None
                                             or window_last_failure > prev_failure):
@@ -306,15 +335,35 @@ def mark_alerted(state: "dict[str, Any]", now: dt.datetime) -> None:
 def load_json(path: Path) -> "dict[str, Any]":
     if not path.exists():
         return {}
-    with path.open(encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with path.open(encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        # A half-written state file must not blind the watchdog forever: without
+        # this the next run dies in load_json every hour and nothing is watching
+        # the scheduler until a human notices. Quarantine it and start clean —
+        # the worst case is one duplicate alert, not permanent silence.
+        quarantine = path.with_name(path.name + ".corrupt")
+        try:
+            os.replace(path, quarantine)
+            print(f"state: corrupt state file quarantined to {quarantine} ({exc})",
+                  file=sys.stderr)
+        except OSError as move_exc:
+            print(f"state: corrupt state file could not be quarantined: {move_exc}",
+                  file=sys.stderr)
+        return {}
 
 
 def save_json(path: Path, payload: "dict[str, Any]") -> None:
+    """Write via temp file + rename so a crash can never truncate the state."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
         f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def send_notification(message: str, notify_bin: Path) -> bool:
