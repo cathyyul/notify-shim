@@ -147,6 +147,31 @@ def test_partial_failure_sends_throttled_alert(monkeypatch, routes_file, alert_c
     assert len(alert_config) == 1  # still one
 
 
+def test_alert_body_strips_ansi_and_control_chars(monkeypatch, routes_file, alert_config):
+    # notify-shim#28: a failing channel's detail carries openclaw's ANSI/control
+    # noise; raw ESC bytes in the body get the email silently dropped by Gmail.
+    def run(cmd, capture_output=False, text=False, env=None, timeout=None):
+        target = cmd[cmd.index("--target") + 1]
+        if target == "Uabc":  # LINE fails with ANSI + box-drawing + control noise
+            return FakeProc(1, stderr="\x1b[32m[state-migrations]\x1b[39m boom\x07\r\n"
+                                      "╭ Doctor notices ──╮")
+        return FakeProc(0, stdout="✅ sent")
+
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    rc = notify_core.main(["--route", "dm", "-m", "hi", "--routes", routes_file])
+    assert rc == 0
+    assert len(alert_config) == 1
+    body = alert_config[0]["body"]
+    # no ESC (0x1b) or other C0 control chars (except the tab/newline layout)
+    assert "\x1b" not in body
+    assert not any(ord(c) < 0x20 and c not in "\n\t" for c in body)
+    assert "\x7f" not in body
+    # the real error text still survives, sanitized
+    assert "boom" in body
+
+
 def test_no_alert_config_still_exits_and_does_not_crash(monkeypatch, routes_file):
     # Default fixture points alert config at a non-existent file → no email,
     # but delivery + exit-code behavior is unaffected.
