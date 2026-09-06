@@ -15,8 +15,31 @@ import notify_core  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _isolate_ledger(tmp_path, monkeypatch):
-    """Point the send-ledger at a temp file so tests never touch the real one."""
+    """Point the send-ledger and failure-alert config/state at temp paths so
+    tests never touch the real files (and, by default, never send an email:
+    the alert config points at a non-existent file → alerting disabled)."""
     monkeypatch.setenv("NOTIFY_LEDGER", str(tmp_path / "ledger.jsonl"))
+    monkeypatch.setenv("NOTIFY_ALERT_CONFIG", str(tmp_path / "no-alert.json"))
+    monkeypatch.setenv("NOTIFY_ALERT_STATE", str(tmp_path / "alert.state.json"))
+
+
+@pytest.fixture
+def alert_config(tmp_path, monkeypatch):
+    """Enable failure-alert email with a temp config; return a spy that records
+    each _send_alert_email call and reports success."""
+    cfg = tmp_path / "failure-alert.json"
+    cfg.write_text(json.dumps({"to": "recip@example.com",
+                               "from_account": "sender@example.com"}),
+                   encoding="utf-8")
+    monkeypatch.setenv("NOTIFY_ALERT_CONFIG", str(cfg))
+    sent = []
+
+    def _spy(config, subject, body, *, timeout=30):
+        sent.append({"config": config, "subject": subject, "body": body})
+        return True, "sent"
+
+    monkeypatch.setattr(notify_core, "_send_alert_email", _spy)
+    return sent
 
 
 ROUTES = {
@@ -86,13 +109,53 @@ def test_notify_fans_out_to_all_channels(monkeypatch, routes_file):
     assert run.calls[0][run.calls[0].index("--message") + 1] == "hello"
 
 
-def test_fail_loud_when_one_channel_fails(monkeypatch, routes_file):
+def test_partial_failure_exits_zero(monkeypatch, routes_file):
+    # notify-shim#26: LINE fails but Telegram delivers → message reached the
+    # user, so the whole flow must NOT fail.
     run = make_run(fail_targets={"Uabc"})  # LINE fails, Telegram ok
     monkeypatch.setattr(notify_core.subprocess, "run", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     rc = notify_core.main(["--route", "dm", "-m", "hi", "--routes", routes_file])
-    assert rc == 1  # any failure -> non-zero
+    assert rc == 0  # partial failure is not fatal
+
+
+def test_total_failure_exits_one(monkeypatch, routes_file):
+    # Every channel failed → genuine outage → non-zero.
+    run = make_run(fail_targets={"111", "Uabc"})
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    rc = notify_core.main(["--route", "dm", "-m", "hi", "--routes", routes_file])
+    assert rc == 1
+
+
+def test_partial_failure_sends_throttled_alert(monkeypatch, routes_file, alert_config):
+    run = make_run(fail_targets={"Uabc"})  # LINE fails
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    rc = notify_core.main(["--route", "dm", "-m", "hi", "--routes", routes_file])
+    assert rc == 0
+    assert len(alert_config) == 1
+    assert alert_config[0]["config"]["to"] == "recip@example.com"
+    assert "line:Uabc" in alert_config[0]["body"]
+
+    # Second failure of the SAME channel on the same day → throttled, no 2nd email.
+    rc = notify_core.main(["--route", "dm", "-m", "hi again", "--routes", routes_file])
+    assert rc == 0
+    assert len(alert_config) == 1  # still one
+
+
+def test_no_alert_config_still_exits_and_does_not_crash(monkeypatch, routes_file):
+    # Default fixture points alert config at a non-existent file → no email,
+    # but delivery + exit-code behavior is unaffected.
+    run = make_run(fail_targets={"Uabc"})
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    rc = notify_core.main(["--route", "dm", "-m", "hi", "--routes", routes_file])
+    assert rc == 0  # partial failure, no config, no crash
 
 
 def test_all_ok_exits_zero(monkeypatch, routes_file):

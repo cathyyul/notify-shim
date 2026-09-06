@@ -7,8 +7,12 @@ message is delivered to each channel via ``openclaw message send``.
 
 Design notes
 ------------
-* **Fail-loud.** If *any* channel fails, the process exits non-zero with a
-  per-channel summary, so a Telegram success can never hide a LINE failure.
+* **Partial failure is not fatal (notify-shim#26).** If some channels fail but
+  at least one delivers, the message reached the user, so the process exits 0
+  and sends a throttled email naming the failed channel(s) (recipient from
+  config) — a per-channel summary still prints to stderr, so a failure is never
+  silently swallowed. Only a *total* outage (every channel failed) exits
+  non-zero.
 * **Config-driven.** Channels per route live in a JSON file (see
   ``routes.example.json``). Adding/removing a channel — or a whole route — is a
   config edit, no code change.
@@ -44,6 +48,145 @@ def ledger_path() -> str:
     return os.environ.get("NOTIFY_LEDGER", "") or str(
         Path.home() / ".openclaw" / "notify" / "send-ledger.jsonl"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Partial-failure email alert (notify-shim#26)
+#
+# When some — but not all — channels fail, the message still reached the user on
+# a working channel, so the process must NOT fail the whole flow (that turned a
+# transient WhatsApp-listener blip into a self-reported job FAILURE upstream —
+# see drift-sentinel exit=1, wsi#121). Instead: keep exit 0 as long as at least
+# one channel delivered, and send a best-effort email naming the failed
+# channel(s) so the failure is never silently swallowed. When EVERY channel
+# fails, exit stays non-zero (a genuine notification outage) — and the email
+# (an independent transport) is the escalation path.
+#
+# The email goes through gog (same mechanism as couple_review_email_nudge.py);
+# recipient/sender come from config, not hardcoded. Throttled to at most one
+# email per channel per day so a channel that keeps failing does not spam.
+# --------------------------------------------------------------------------- #
+def alert_config_path() -> str:
+    """Failure-alert email config path (env override for tests)."""
+    return os.environ.get("NOTIFY_ALERT_CONFIG", "") or str(
+        Path.home() / ".openclaw" / "notify" / "failure-alert.json"
+    )
+
+
+def alert_state_path() -> str:
+    """Per-channel-per-day throttle state path (env override for tests)."""
+    return os.environ.get("NOTIFY_ALERT_STATE", "") or str(
+        Path.home() / ".openclaw" / "notify" / "failure-alert.state.json"
+    )
+
+
+def _placeholder(v: str) -> bool:
+    return not v or v.startswith("REPLACE_WITH")
+
+
+def load_alert_config():
+    """Return the alert-email config dict, or ``None`` when alerting is not set
+    up (file missing, ``enabled: false``, placeholder/blank fields, or malformed
+    JSON). Never raises — a broken alert config must not break delivery."""
+    path = alert_config_path()
+    try:
+        cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        print(f"notify: failure-alert config unreadable ({exc}); "
+              f"skipping email alert", file=sys.stderr)
+        return None
+    if not isinstance(cfg, dict) or not cfg.get("enabled", True):
+        return None
+    to = cfg.get("to", "")
+    frm = cfg.get("from_account", "")
+    if not isinstance(to, str) or not isinstance(frm, str) \
+            or _placeholder(to) or _placeholder(frm):
+        return None
+    return {"to": to, "from_account": frm}
+
+
+def find_gog() -> str:
+    """Resolve the gog binary (env override > PATH > known install dirs).
+    Under launchd's minimal PATH, Homebrew CLIs are not on PATH."""
+    override = os.environ.get("GOG_BIN", "")
+    if override:
+        return override
+    found = shutil.which("gog")
+    if found:
+        return found
+    for cand in ("/opt/homebrew/bin/gog", "/usr/local/bin/gog"):
+        if Path(cand).exists():
+            return cand
+    return "gog"
+
+
+def _send_alert_email(cfg, subject: str, body: str, *, timeout: int = 30):
+    """Send the failure alert via gog. Return ``(ok, detail)`` — never raises,
+    so a stalled/absent gog becomes a failed-send result, not a crash. A bounded
+    timeout stops a wedged gog from hanging the notify call."""
+    gog = find_gog()
+    cmd = [gog, "send", "--account", cfg["from_account"], "--to", cfg["to"],
+           "--subject", subject, "--body", body, "--no-input"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              env=_env_with_binary_on_path(gog), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, f"gog send timed out after {timeout}s"
+    except OSError as exc:
+        return False, f"gog send could not run ({exc})"
+    if proc.returncode == 0:
+        return True, "sent"
+    return False, (proc.stderr or proc.stdout or "gog send failed").strip()[:200]
+
+
+def maybe_send_failure_alert(route: str, results, *, dry_run: bool) -> None:
+    """Best-effort email when one or more channels failed, throttled to one
+    email per channel per day. Never raises."""
+    failed = [(ch, tgt, detail) for (ch, tgt, ok, detail) in results if not ok]
+    if not failed or dry_run:
+        return
+    cfg = load_alert_config()
+    if cfg is None:
+        print("notify: channel(s) failed but failure-alert email is not "
+              "configured (~/.openclaw/notify/failure-alert.json) — skipping",
+              file=sys.stderr)
+        return
+    today = dt.date.today().isoformat()
+    try:
+        state = json.loads(Path(alert_state_path()).read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            state = {}
+    except (FileNotFoundError, OSError, ValueError):
+        state = {}
+    fresh = [f for f in failed if state.get(f[0]) != today]
+    if not fresh:  # every failed channel already alerted today
+        return
+    lines = [f"Route: {route}", f"Time: {dt.datetime.now().astimezone().isoformat()}",
+             "", "Failed channel(s):"]
+    lines += [f"  - {ch}:{tgt} — {detail}" for (ch, tgt, detail) in failed]
+    lines += ["", "Other channels on this route delivered normally (the message "
+              "was not lost) unless this route has only failed channels.",
+              "Fix the failing channel (e.g. re-link WhatsApp / restart the "
+              "gateway), then delivery resumes automatically."]
+    subject = f"[notify] {len(failed)} channel(s) failed on route '{route}'"
+    ok, detail = _send_alert_email(cfg, subject, "\n".join(lines))
+    if not ok:
+        print(f"notify: failure-alert email send failed ({detail})",
+              file=sys.stderr)
+        return  # do not advance throttle → retry on the next failure
+    for ch, _tgt, _detail in fresh:
+        state[ch] = today
+    try:
+        Path(alert_state_path()).parent.mkdir(parents=True, exist_ok=True)
+        Path(alert_state_path()).write_text(
+            json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    except OSError as exc:
+        print(f"notify: failure-alert throttle-state write failed ({exc})",
+              file=sys.stderr)
+    print(f"notify: failure-alert email sent to {cfg['to']} "
+          f"({len(fresh)} channel(s))", file=sys.stderr)
 
 
 def _record_ledger(route: str, results, *, dry_run: bool) -> None:
@@ -219,6 +362,7 @@ def main(argv=None) -> int:
         return 0
 
     failed = [r for r in results if not r[2]]
+    succeeded = [r for r in results if r[2]]
     for channel, target, ok, detail in results:
         status = "ok" if ok else "FAIL"
         line = f"[{status}] {channel}:{target}"
@@ -227,12 +371,18 @@ def main(argv=None) -> int:
         print(line, file=sys.stderr)
 
     if failed:
+        maybe_send_failure_alert(args.route, results, dry_run=args.dry_run)
         print(
             f"notify: {len(failed)}/{len(results)} channel(s) FAILED "
             f"for route '{args.route}'",
             file=sys.stderr,
         )
-        return 1
+        # Partial failure must NOT fail the whole flow (notify-shim#26): if at
+        # least one channel delivered, the message reached the user, so exit 0
+        # and let the throttled email alert carry the failure. Only a total
+        # outage (no channel delivered) is a non-zero exit.
+        if not succeeded:
+            return 1
     return 0
 
 

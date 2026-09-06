@@ -52,6 +52,13 @@
       "mode": "seed",
       "chmod": "0600",
       "note": "真實收件人（Chi email）+ 寄件帳號住 repo 外，永不覆蓋既有"
+    },
+    {
+      "src": "failure-alert.example.json",
+      "dest": "~/.openclaw/notify/failure-alert.json",
+      "mode": "seed",
+      "chmod": "0600",
+      "note": "notify-shim#26 部分 channel 失敗時的 email 告警設定（真實收件/寄件帳號住 repo 外的本地 ~/.openclaw/notify/failure-alert.json，同 review-email.json 慣例；repo 只放 placeholder，seed 永不覆蓋既有）"
     }
   ],
   "removals": [],
