@@ -49,6 +49,25 @@ CONFIRM_A = "2026-08-22 09:40:00 [info] [CCDScheduledTasks] Confirmed task run f
 CONFIRM_B = ("2026-08-22 09:30:00 [info] [CCDScheduledTasks] "
              "Confirmed task run for: travel-concierge-update")
 
+# Quota case (real 2026-09-05 daily-memory-sync sequence): spawn → Confirmed →
+# start-timing binds the session id → CycleHealth api_error on a session limit.
+USAGE_SPAWN = ("2026-09-05 23:03:49 [info] [CCDScheduledTasks] Spawning new session "
+               "for scheduled task daily-memory-sync { cronExpression: '0 23 * * *' }")
+USAGE_CONFIRM = ("2026-09-05 23:03:49 [info] [CCDScheduledTasks] "
+                 "Confirmed task run for: daily-memory-sync")
+USAGE_START = ("2026-09-05 23:03:50 [info] [CCD start-timing] "
+               "local_567d68b6-f2ec-4698-ac85-b3f0dda33556 preflight=5ms init=842")
+USAGE_APIERR = ("2026-09-05 23:03:50 [warn] [CCD CycleHealth] "
+                "local_567d68b6-f2ec-4698-ac85-b3f0dda33556 api_error (success): "
+                "You've hit your session limit · resets 12am (America/Los_Angeles)")
+USAGE_UNHEALTHY = ("2026-09-05 23:03:50 [info] [CCD CycleHealth] unhealthy cycle for "
+                   "local_567d68b6-f2ec-4698-ac85-b3f0dda33556 (1s, reason=api_error)")
+# An interactive (non-scheduled) session hitting the same limit — no spawn bound
+# its session id, so it must NOT be attributed to any routine.
+INTERACTIVE_APIERR = ("2026-09-05 14:00:01 [warn] [CCD CycleHealth] "
+                      "local_ffffffff-0000-0000-0000-000000000000 api_error (success): "
+                      "You've hit your session limit · resets 12am")
+
 
 def T(s):
     return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
@@ -1395,3 +1414,53 @@ class TestFormatting:
         assert "session_stale_relogin" in msg
         assert "重新登入" in msg
         assert "process-replies" in msg
+
+
+class TestUsageLimit:
+    SEQ = [USAGE_SPAWN, USAGE_CONFIRM, USAGE_START, USAGE_APIERR, USAGE_UNHEALTHY]
+
+    def test_parse_binds_session_and_emits_usage_limit(self):
+        events = mod.parse_events(self.SEQ)
+        ul = [e for e in events if e.kind == "usage_limit"]
+        assert len(ul) == 1
+        assert ul[0].task == "daily-memory-sync"
+        assert ul[0].detail == "resets 12am"
+        # the Confirmed line is still parsed (it precedes the api_error)
+        assert any(e.kind == "confirm" and e.task == "daily-memory-sync" for e in events)
+
+    def test_usage_limit_after_confirm_still_alerts(self):
+        state = {}
+        result = mod.evaluate(state, mod.parse_events(self.SEQ),
+                              now=T("2026-09-05 23:10:00"))
+        assert result.alert_message is not None
+        inc = state["active_incident"]
+        assert mod.CAUSE_USAGE_LIMIT in inc["causes"]
+        # classified as quota, not the generic unconfirmed-spawn cause
+        assert mod.CAUSE_UNCONFIRMED not in inc["causes"]
+        assert inc["affected_tasks"] == ["daily-memory-sync"]
+        assert "額度用盡" in result.alert_message
+        assert "resets 12am" in result.alert_message
+        assert "daily-memory-sync" in result.alert_message
+
+    def test_interactive_session_limit_not_attributed(self):
+        # No scheduled-task spawn bound this session id → no usage_limit event.
+        events = mod.parse_events([INTERACTIVE_APIERR])
+        assert [e for e in events if e.kind == "usage_limit"] == []
+        state = {}
+        result = mod.evaluate(state, events, now=T("2026-09-05 14:10:00"))
+        assert result.alert_message is None
+        assert state.get("active_incident") is None
+
+    def test_recovery_after_clean_confirm(self):
+        state = {}
+        mod.evaluate(state, mod.parse_events(self.SEQ), now=T("2026-09-05 23:10:00"))
+        mod.mark_alerted(state, T("2026-09-05 23:10:00"))
+        # Next day: a clean confirm with no following api_error → recovered.
+        recover = "2026-09-06 23:03:50 [info] [CCDScheduledTasks] Confirmed task run for: daily-memory-sync"
+        result = mod.evaluate(state, mod.parse_events([recover]),
+                              now=T("2026-09-06 23:10:00"))
+        assert result.recovery_message is not None
+        assert result.incident_active is False
+        # the incident is held until a notifying run delivers the recovery notice
+        mod.mark_recovered(state)
+        assert state.get("active_incident") is None
