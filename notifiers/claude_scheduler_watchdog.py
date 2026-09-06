@@ -38,19 +38,31 @@ MARKER_SPAWN = "[CCDScheduledTasks] Spawning new session for scheduled task "
 MARKER_CONFIRM = "[CCDScheduledTasks] Confirmed task run for: "
 MARKER_CLEARED = "[CCDScheduledTasks] Cleared stale pending dispatch for: "
 MARKER_STALE = "session_stale_relogin"
+# A scheduled-task session's start-timing line names the session id; the next
+# CycleHealth api_error line for that id (with a usage/session-limit phrase) is
+# the quota signal. We bind session id -> task via these two so a usage-limit
+# failure can be attributed to the right routine — and only to a routine, never
+# to an interactive session that happened to hit the same limit (#30).
+MARKER_START_TIMING = "[CCD start-timing] "
+MARKER_CYCLEHEALTH = "[CCD CycleHealth] "
+# Phrases that mark an api_error as a quota/usage exhaustion (vs any other API
+# error). Matched case-insensitively.
+LIMIT_PHRASES = ("session limit", "usage limit")
 
 TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 CAUSE_STALE = "session_stale_relogin"
 CAUSE_UNCONFIRMED = "unconfirmed_spawn"
 CAUSE_BLIND = "cannot_observe"
+CAUSE_USAGE_LIMIT = "usage_limit"
 
 
 @dataclass
 class LogEvent:
-    kind: str  # "spawn" | "confirm" | "cleared" | "stale"
+    kind: str  # "spawn" | "confirm" | "cleared" | "stale" | "usage_limit"
     ts: Optional[dt.datetime]
     task: Optional[str] = None
+    detail: Optional[str] = None  # usage_limit: the "resets …" reset hint, if any
 
 
 @dataclass
@@ -96,9 +108,59 @@ def parse_ts(value: Optional[str]) -> Optional[dt.datetime]:
         return None
 
 
-def parse_events(lines: "list[str]") -> "list[LogEvent]":
+def _session_id_after(line: str, marker: str) -> Optional[str]:
+    """First whitespace-delimited token after ``marker`` — the ``local_<id>``
+    session id in start-timing / CycleHealth lines."""
+    rest = line.split(marker, 1)[1].strip()
+    sid = rest.split(" ", 1)[0].strip() if rest else ""
+    return sid or None
+
+
+def _reset_hint(line: str) -> Optional[str]:
+    """Extract the human 'resets …' hint from a session-limit line, if present:
+    'You've hit your session limit · resets 12am (…)' -> 'resets 12am'."""
+    if "resets " not in line:
+        return None
+    tail = "resets " + line.split("resets ", 1)[1]
+    for sep in ("·", "(", "\n"):
+        tail = tail.split(sep, 1)[0]
+    return tail.strip() or None
+
+
+# Bounds on the persisted session-binding maps so they can never grow without
+# limit across runs (spawns whose start-timing / api_error never arrive).
+_MAX_AWAITING = 64
+_MAX_SESSION_TASK = 128
+
+
+def _bounded_pop_oldest(d: "dict[str, Any]", cap: int) -> None:
+    while len(d) > cap:
+        d.pop(next(iter(d)))
+
+
+def _bounded_pop_oldest_list(lst: "list[Any]", cap: int) -> None:
+    while len(lst) > cap:
+        lst.pop(0)
+
+
+def parse_events(lines: "list[str]",
+                 session_state: "Optional[dict[str, Any]]" = None) -> "list[LogEvent]":
+    """Parse log lines into events.
+
+    ``session_state`` carries the spawn→session→task binding ACROSS calls
+    (#30): the watchdog reads the log incrementally, so a task's spawn, its
+    ``start-timing`` and its ``CycleHealth`` api_error can land in different
+    reads. When a persistent dict is passed (main() stores it in the state
+    file) the binding survives those boundaries; tests may omit it for a
+    single-call parse. ``awaiting`` is a FIFO queue, not a scalar, so several
+    tasks spawning before their start-timing lines each bind to the right
+    session in spawn order."""
     events: "list[LogEvent]" = []
     last_ts: Optional[dt.datetime] = None
+    if session_state is None:
+        session_state = {}
+    awaiting: "list[str]" = session_state.setdefault("awaiting", [])
+    session_task: "dict[str, str]" = session_state.setdefault("session_task", {})
     for line in lines:
         ts = parse_line_ts(line)
         if ts is not None:
@@ -108,6 +170,22 @@ def parse_events(lines: "list[str]") -> "list[LogEvent]":
             task = rest.split(" ", 1)[0].strip().rstrip("{")
             if task:
                 events.append(LogEvent("spawn", last_ts, task))
+                awaiting.append(task)
+                _bounded_pop_oldest_list(awaiting, _MAX_AWAITING)
+        elif MARKER_START_TIMING in line:
+            sid = _session_id_after(line, MARKER_START_TIMING)
+            if sid and awaiting:
+                session_task[sid] = awaiting.pop(0)  # FIFO: oldest spawn first
+                _bounded_pop_oldest(session_task, _MAX_SESSION_TASK)
+        elif MARKER_CYCLEHEALTH in line and "api_error" in line \
+                and any(p in line.lower() for p in LIMIT_PHRASES):
+            sid = _session_id_after(line, MARKER_CYCLEHEALTH)
+            task = session_task.pop(sid, None) if sid else None
+            # Only a session we bound to a scheduled task counts; an interactive
+            # session hitting the same limit must never be attributed to a routine.
+            if task:
+                events.append(LogEvent("usage_limit", last_ts, task,
+                                       detail=_reset_hint(line)))
         elif MARKER_CONFIRM in line:
             task = line.split(MARKER_CONFIRM, 1)[1].strip()
             if task:
@@ -249,6 +327,15 @@ def format_alert(incident: "dict[str, Any]") -> str:
         lines.append(
             "修法：在 Mac mini 上重新登入 Claude desktop app；"
             "登入後排程會自動恢復（watchdog 會另發恢復通知）。")
+    if CAUSE_USAGE_LIMIT in causes:
+        reset = incident.get("usage_reset_hint")
+        reset_txt = f"（{reset}）" if reset else ""
+        lines.append(
+            "原因：Claude 額度用盡（session/usage limit）——排程 session 一起手就 "
+            f"api_error 死掉、該 routine 這次沒跑{reset_txt}。")
+        lines.append(
+            "修法：等額度重置後會自動恢復；incremental routine（如 daily-memory-sync）"
+            "下次成功執行會自動補齊積壓。若經常撞額度＝usage pacing 問題（錯開時段／減量）。")
     if CAUSE_UNCONFIRMED in causes:
         # Every active cause renders its own remedy. With `elif` here, an
         # incident that was both a login latch and a task timeout only ever
@@ -304,11 +391,19 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
     # dispatch in the same second came first, and the two orders mean opposite
     # things. Log order is the only ordering the log actually gives us.
     open_failures: "dict[str, Optional[dt.datetime]]" = {}
+    # Subset of open_failures that failed specifically on a usage/session limit —
+    # tracked apart so the alert can name the quota cause (and its reset hint)
+    # rather than the generic "spawn未Confirmed" (#30).
+    usage_limit_open: "dict[str, Optional[dt.datetime]]" = {}
+    usage_reset_hint: Optional[str] = None
     stale_open = False
     stale_at: Optional[dt.datetime] = None
     if incident is not None:
         for task, ts_str in (incident.get("open_failures") or {}).items():
             open_failures[task] = parse_ts(ts_str)
+        for task, ts_str in (incident.get("usage_limit_open") or {}).items():
+            usage_limit_open[task] = parse_ts(ts_str)
+        usage_reset_hint = incident.get("usage_reset_hint")
         stale_open = bool(incident.get("stale_open"))
         stale_at = parse_ts(incident.get("stale_last_at"))
 
@@ -335,12 +430,23 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
         elif ev.kind == "confirm":
             # Task-level accounting (see the limitation noted in the README): a
             # confirm says this task is running again, so it closes whatever was
-            # outstanding for it.
+            # outstanding for it. A usage_limit that appears AFTER this confirm
+            # (the quota case is spawn→confirm→api_error) re-opens it below —
+            # confirm alone does not prove the run actually succeeded.
             pending = [p for p in pending if p["task"] != ev.task]
             open_failures.pop(ev.task, None)
+            usage_limit_open.pop(ev.task, None)
             if ev.ts is not None and (newest_confirm_at is None or ev.ts > newest_confirm_at):
                 newest_confirm_at = ev.ts
             last_confirm = ev
+        elif ev.kind == "usage_limit":
+            # The spawned session died on a session/usage limit — the routine did
+            # not actually run, even though a Confirmed line was logged first.
+            note_failure(ev.task, ev.ts)
+            if ev.task is not None:
+                usage_limit_open[ev.task] = ev.ts
+            if ev.detail:
+                usage_reset_hint = ev.detail
         elif ev.kind == "cleared":
             pending = [p for p in pending if p["task"] != ev.task]
             note_failure(ev.task, ev.ts)
@@ -399,6 +505,7 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
         # recovery event, advances the log offset, and the notice is lost.
         incident["resolved_by"] = resolver
         incident["open_failures"] = {}
+        incident["usage_limit_open"] = {}
         incident["stale_open"] = False
         state["active_incident"] = incident
         return EvalResult(None, format_recovery(incident, resolver),
@@ -417,7 +524,12 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
     causes = set()
     if stale_open:
         causes.add(CAUSE_STALE)
-    if open_failures:
+    # A task down on a usage limit is classified as usage_limit, not the generic
+    # unconfirmed-spawn cause — only tasks that failed for some OTHER reason keep
+    # CAUSE_UNCONFIRMED, so a pure quota incident renders only the quota remedy.
+    if usage_limit_open:
+        causes.add(CAUSE_USAGE_LIMIT)
+    if set(open_failures) - set(usage_limit_open):
         causes.add(CAUSE_UNCONFIRMED)
     if blind_open:
         causes.add(CAUSE_BLIND)
@@ -426,6 +538,8 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
     incident["affected_tasks"] = sorted(
         set(incident.get("affected_tasks", [])) | set(open_failures))
     incident["open_failures"] = {task: fmt_ts(ts) for task, ts in open_failures.items()}
+    incident["usage_limit_open"] = {task: fmt_ts(ts) for task, ts in usage_limit_open.items()}
+    incident["usage_reset_hint"] = usage_reset_hint
     incident["stale_open"] = stale_open
     incident["stale_last_at"] = fmt_ts(stale_at)
     # Something is broken again, so any recovery notice still queued is void.
@@ -534,6 +648,16 @@ def _state_is_usable(state: Any) -> bool:
             return False
         if not optional_ts(row.get("ts")):
             return False
+    if wrong(state, "session_binding", dict):
+        return False
+    sb = state.get("session_binding") or {}
+    if wrong(sb, "awaiting", list) or wrong(sb, "session_task", dict):
+        return False
+    if not all(isinstance(t, str) for t in sb.get("awaiting") or []):
+        return False
+    if not all(isinstance(k, str) and isinstance(v, str)
+               for k, v in (sb.get("session_task") or {}).items()):
+        return False
     incident = state.get("active_incident")
     if "active_incident" in state and incident is not None:
         if not isinstance(incident, dict):
@@ -546,17 +670,19 @@ def _state_is_usable(state: Any) -> bool:
         for key in ("first_seen_at", "last_alert_at", "last_failure_at", "stale_last_at"):
             if not optional_ts(incident.get(key)):
                 return False
-        if not optional_text(incident.get("blind_reason")):
+        if not optional_text(incident.get("blind_reason")) \
+                or not optional_text(incident.get("usage_reset_hint")):
             return False
         if "stale_open" in incident and not isinstance(incident["stale_open"], bool):
             return False
-        for key in ("open_failures", "resolved_by"):
+        for key in ("open_failures", "usage_limit_open", "resolved_by"):
             if key in incident and incident[key] is not None \
                     and not isinstance(incident[key], dict):
                 return False
-        for task, ts in (incident.get("open_failures") or {}).items():
-            if not isinstance(task, str) or not optional_ts(ts):
-                return False
+        for key in ("open_failures", "usage_limit_open"):
+            for task, ts in (incident.get(key) or {}).items():
+                if not isinstance(task, str) or not optional_ts(ts):
+                    return False
         resolved = incident.get("resolved_by") or {}
         if not optional_text(resolved.get("kind")) or not optional_text(resolved.get("task")):
             return False
@@ -650,7 +776,10 @@ def _run(args: argparse.Namespace, state_problem: Optional[str] = None,
     bootstrap_since = now - dt.timedelta(hours=args.bootstrap_window_hours)
     read = read_new_lines(args.log_file, state.get("log"),
                           bootstrap_since=bootstrap_since)
-    events = parse_events(read.lines)
+    # Persist the spawn→session→task binding across runs so a spawn in one read
+    # and its usage-limit api_error in the next still resolve to the task (#30).
+    session_binding = state.setdefault("session_binding", {})
+    events = parse_events(read.lines, session_state=session_binding)
     if read.cold:
         # A cold start reads whole files, so bound it by age: report what is
         # happening now, not an incident that was resolved months ago.
