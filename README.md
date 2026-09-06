@@ -31,9 +31,48 @@ notify-group-couple "這週要買的東西…"
 notify-dm --dry-run "preview, nothing is sent"
 ```
 
-Exit code is **0 only if every channel succeeded**. If any channel fails the
-shim prints a per-channel summary to stderr and exits non-zero — a Telegram
-success never hides a LINE failure.
+Exit code: **0 if at least one channel delivered.** A per-channel summary is
+always printed to stderr, so a Telegram success never silently hides a LINE
+failure. When some — but not all — channels fail, the message still reached the
+user, so the shim exits 0 and sends a throttled email naming the failed
+channel(s) (see [Failure-alert email](#failure-alert-email-failure-alertjson)).
+Only a **total** outage (every channel failed) exits non-zero.
+
+> Why partial failure is not fatal (notify-shim#26): the old "any failure →
+> non-zero" turned a transient single-channel blip (e.g. the WhatsApp Web
+> listener dropping) into a self-reported job **failure** upstream — e.g.
+> drift-sentinel exited 1 and re-reported itself as `LAUNCHD_FAILED` even though
+> its DM had already reached Yuting via Telegram (wsi#121). The failure is now
+> carried by the email alert instead of by the exit code.
+
+## Failure-alert email (`failure-alert.json`)
+
+When a channel fails, the shim can email a summary so the failure is not lost.
+Recipient/sender live in a local, gitignored config (default
+`~/.openclaw/notify/failure-alert.json`, override `$NOTIFY_ALERT_CONFIG`); the
+repo ships [`failure-alert.example.json`](failure-alert.example.json):
+
+```json
+{
+  "to": "REPLACE_WITH_RECIPIENT@example.com",
+  "from_account": "REPLACE_WITH_SENDER@gmail.com",
+  "enabled": true
+}
+```
+
+Like `routes.json` and `review-email.json`, the **real** recipient/sender are
+**not** in this repo — they live only in the local, out-of-repo
+`~/.openclaw/notify/failure-alert.json` (0600). The repo ships placeholders; the
+seed deploy never overwrites an existing local file, so fill it in once with a
+real recipient and a `gog`-authenticated sender.
+
+The email goes out through `gog` (same mechanism as the couple review nudge).
+Alerting is **off until `from_account` is a real gog-authenticated sender** (a
+placeholder, blank field, missing file, or `"enabled": false` disables it — the
+shim just logs "not configured" and skips; delivery and exit code are
+unaffected). Throttled to **at most one email per channel per day** (state in
+`~/.openclaw/notify/failure-alert.state.json`, override `$NOTIFY_ALERT_STATE`)
+so a persistently-failing channel does not spam.
 
 ## Config (`routes.json`)
 
