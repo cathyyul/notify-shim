@@ -29,6 +29,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -141,6 +142,28 @@ def _send_alert_email(cfg, subject: str, body: str, *, timeout: int = 30):
     return False, (proc.stderr or proc.stdout or "gog send failed").strip()[:200]
 
 
+# ANSI/CSI escape sequences (colours, cursor moves) — openclaw's stderr is full
+# of them, and raw ESC (0x1b) bytes in an email body get the message silently
+# dropped by Gmail (notify-shim#28: the API accepts it and returns a messageId,
+# but it never reaches the inbox — not even spam).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+# C0 control characters except tab/newline, plus DEL — also unsafe in a body.
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _sanitize_for_email(text: str, *, limit: int = 500) -> str:
+    """Strip ANSI escapes and control characters so the alert body is plain,
+    deliverable text (notify-shim#28). Collapses runs of whitespace to keep the
+    multi-line openclaw doctor-notice noise to one readable line, and truncates
+    to keep the email tidy."""
+    clean = _ANSI_RE.sub("", text or "")
+    clean = _CTRL_RE.sub("", clean)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    if len(clean) > limit:
+        clean = clean[:limit].rstrip() + "…"
+    return clean
+
+
 def maybe_send_failure_alert(route: str, results, *, dry_run: bool) -> None:
     """Best-effort email when one or more channels failed, throttled to one
     email per channel per day. Never raises."""
@@ -165,7 +188,8 @@ def maybe_send_failure_alert(route: str, results, *, dry_run: bool) -> None:
         return
     lines = [f"Route: {route}", f"Time: {dt.datetime.now().astimezone().isoformat()}",
              "", "Failed channel(s):"]
-    lines += [f"  - {ch}:{tgt} — {detail}" for (ch, tgt, detail) in failed]
+    lines += [f"  - {ch}:{tgt} — {_sanitize_for_email(detail)}"
+              for (ch, tgt, detail) in failed]
     lines += ["", "Other channels on this route delivered normally (the message "
               "was not lost) unless this route has only failed channels.",
               "Fix the failing channel (e.g. re-link WhatsApp / restart the "
