@@ -1464,3 +1464,40 @@ class TestUsageLimit:
         # the incident is held until a notifying run delivers the recovery notice
         mod.mark_recovered(state)
         assert state.get("active_incident") is None
+
+
+class TestUsageLimitBinding:
+    def test_fifo_binding_two_concurrent_spawns(self):
+        # Two tasks spawn before either start-timing → each must bind to its own
+        # session in spawn order (P1: scalar awaiting clobbered the first).
+        sa = ("2026-09-05 23:00:00 [info] [CCDScheduledTasks] Spawning new session "
+              "for scheduled task task-a { cronExpression: '0 23 * * *' }")
+        sb = ("2026-09-05 23:00:00 [info] [CCDScheduledTasks] Spawning new session "
+              "for scheduled task task-b { cronExpression: '0 23 * * *' }")
+        start_a = "2026-09-05 23:00:01 [info] [CCD start-timing] local_aaaa preflight=5ms"
+        start_b = "2026-09-05 23:00:01 [info] [CCD start-timing] local_bbbb preflight=5ms"
+        err_b = ("2026-09-05 23:00:02 [warn] [CCD CycleHealth] local_bbbb api_error "
+                 "(success): You've hit your session limit · resets 12am")
+        events = mod.parse_events([sa, sb, start_a, start_b, err_b])
+        ul = [e for e in events if e.kind == "usage_limit"]
+        assert len(ul) == 1 and ul[0].task == "task-b"  # bbbb → task-b, not task-a
+
+    def test_binding_persists_across_incremental_reads(self):
+        # spawn+start in one read, api_error in the next — shared session_state
+        # (as main() persists in the state file) must still resolve the task.
+        ss: dict = {}
+        e1 = mod.parse_events([USAGE_SPAWN, USAGE_START], session_state=ss)
+        assert [e for e in e1 if e.kind == "usage_limit"] == []
+        e2 = mod.parse_events([USAGE_APIERR], session_state=ss)
+        ul = [e for e in e2 if e.kind == "usage_limit"]
+        assert len(ul) == 1 and ul[0].task == "daily-memory-sync"
+
+    def test_session_task_map_is_bounded(self):
+        ss: dict = {}
+        lines = []
+        for i in range(mod._MAX_SESSION_TASK + 20):
+            lines.append(f"2026-09-05 23:00:00 [info] [CCDScheduledTasks] Spawning new "
+                         f"session for scheduled task t{i} {{ cronExpression: '* * * * *' }}")
+            lines.append(f"2026-09-05 23:00:01 [info] [CCD start-timing] local_s{i} preflight=1ms")
+        mod.parse_events(lines, session_state=ss)
+        assert len(ss["session_task"]) <= mod._MAX_SESSION_TASK

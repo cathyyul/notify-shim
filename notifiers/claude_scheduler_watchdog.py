@@ -127,13 +127,40 @@ def _reset_hint(line: str) -> Optional[str]:
     return tail.strip() or None
 
 
-def parse_events(lines: "list[str]") -> "list[LogEvent]":
+# Bounds on the persisted session-binding maps so they can never grow without
+# limit across runs (spawns whose start-timing / api_error never arrive).
+_MAX_AWAITING = 64
+_MAX_SESSION_TASK = 128
+
+
+def _bounded_pop_oldest(d: "dict[str, Any]", cap: int) -> None:
+    while len(d) > cap:
+        d.pop(next(iter(d)))
+
+
+def _bounded_pop_oldest_list(lst: "list[Any]", cap: int) -> None:
+    while len(lst) > cap:
+        lst.pop(0)
+
+
+def parse_events(lines: "list[str]",
+                 session_state: "Optional[dict[str, Any]]" = None) -> "list[LogEvent]":
+    """Parse log lines into events.
+
+    ``session_state`` carries the spawn→session→task binding ACROSS calls
+    (#30): the watchdog reads the log incrementally, so a task's spawn, its
+    ``start-timing`` and its ``CycleHealth`` api_error can land in different
+    reads. When a persistent dict is passed (main() stores it in the state
+    file) the binding survives those boundaries; tests may omit it for a
+    single-call parse. ``awaiting`` is a FIFO queue, not a scalar, so several
+    tasks spawning before their start-timing lines each bind to the right
+    session in spawn order."""
     events: "list[LogEvent]" = []
     last_ts: Optional[dt.datetime] = None
-    # Bind a scheduled-task spawn to the session id it produces, so a later
-    # CycleHealth usage-limit error can be attributed to the right task (#30).
-    awaiting_session_task: Optional[str] = None
-    session_task: "dict[str, str]" = {}
+    if session_state is None:
+        session_state = {}
+    awaiting: "list[str]" = session_state.setdefault("awaiting", [])
+    session_task: "dict[str, str]" = session_state.setdefault("session_task", {})
     for line in lines:
         ts = parse_line_ts(line)
         if ts is not None:
@@ -143,16 +170,17 @@ def parse_events(lines: "list[str]") -> "list[LogEvent]":
             task = rest.split(" ", 1)[0].strip().rstrip("{")
             if task:
                 events.append(LogEvent("spawn", last_ts, task))
-                awaiting_session_task = task
+                awaiting.append(task)
+                _bounded_pop_oldest_list(awaiting, _MAX_AWAITING)
         elif MARKER_START_TIMING in line:
             sid = _session_id_after(line, MARKER_START_TIMING)
-            if sid and awaiting_session_task is not None:
-                session_task[sid] = awaiting_session_task
-                awaiting_session_task = None
+            if sid and awaiting:
+                session_task[sid] = awaiting.pop(0)  # FIFO: oldest spawn first
+                _bounded_pop_oldest(session_task, _MAX_SESSION_TASK)
         elif MARKER_CYCLEHEALTH in line and "api_error" in line \
                 and any(p in line.lower() for p in LIMIT_PHRASES):
             sid = _session_id_after(line, MARKER_CYCLEHEALTH)
-            task = session_task.get(sid) if sid else None
+            task = session_task.pop(sid, None) if sid else None
             # Only a session we bound to a scheduled task counts; an interactive
             # session hitting the same limit must never be attributed to a routine.
             if task:
@@ -620,6 +648,16 @@ def _state_is_usable(state: Any) -> bool:
             return False
         if not optional_ts(row.get("ts")):
             return False
+    if wrong(state, "session_binding", dict):
+        return False
+    sb = state.get("session_binding") or {}
+    if wrong(sb, "awaiting", list) or wrong(sb, "session_task", dict):
+        return False
+    if not all(isinstance(t, str) for t in sb.get("awaiting") or []):
+        return False
+    if not all(isinstance(k, str) and isinstance(v, str)
+               for k, v in (sb.get("session_task") or {}).items()):
+        return False
     incident = state.get("active_incident")
     if "active_incident" in state and incident is not None:
         if not isinstance(incident, dict):
@@ -738,7 +776,10 @@ def _run(args: argparse.Namespace, state_problem: Optional[str] = None,
     bootstrap_since = now - dt.timedelta(hours=args.bootstrap_window_hours)
     read = read_new_lines(args.log_file, state.get("log"),
                           bootstrap_since=bootstrap_since)
-    events = parse_events(read.lines)
+    # Persist the spawn→session→task binding across runs so a spawn in one read
+    # and its usage-limit api_error in the next still resolve to the task (#30).
+    session_binding = state.setdefault("session_binding", {})
+    events = parse_events(read.lines, session_state=session_binding)
     if read.cold:
         # A cold start reads whole files, so bound it by age: report what is
         # happening now, not an incident that was resolved months ago.
