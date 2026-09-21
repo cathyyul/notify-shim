@@ -240,6 +240,44 @@ def check_line(config: dict[str, Any], gateway_port: int, timeout: float) -> Che
     return CheckResult("line", False, failures[0].status, detail, next_steps)
 
 
+# WhatsApp 被伺服器登出（terminal disconnect）是一種**重啟無效**的失敗：creds 檔還在，
+# 所以 linked / statusState 仍是 true / "linked"，但 session 已經死了。判別靠 probe 的
+# terminalDisconnect / healthState；`lastDisconnect.loggedOut` **不可用**——實測被登出時
+# 它是 false（notify-shim#32 的實際 payload）。
+TERMINAL_DISCONNECT_HEALTH = "terminal-disconnect"
+WHATSAPP_LOGGED_OUT_STATUS = "whatsapp_logged_out"
+WHATSAPP_LOGGED_OUT_NEXT_STEP = (
+    "WhatsApp session 已被登出，重啟 gateway 無效；需本人執行 "
+    "`openclaw channels login --channel whatsapp` 掃 QR 重新連結。"
+)
+GATEWAY_RESTART_SKIPPED_STATUS = "gateway_restart_skipped_terminal_disconnect"
+
+
+def whatsapp_terminal_disconnect(account: dict[str, Any], channel: dict[str, Any],
+                                 health: str | None) -> tuple[bool, int | None]:
+    """(是不是 terminal disconnect, lastDisconnect 的 HTTP 狀態碼)。
+
+    `lastDisconnect` 是**歷史**欄位：重新連結後那顆 401 還會留著。所以只有在 probe 根本
+    沒給 `terminalDisconnect` 布林值時（舊版 gateway）才退回用它判斷——探針明講
+    `terminalDisconnect: false` 時，不得讓一顆過期的 401 蓋過現況。
+    """
+    last_disconnect = account.get("lastDisconnect")
+    if not isinstance(last_disconnect, dict):
+        last_disconnect = channel.get("lastDisconnect")
+    if not isinstance(last_disconnect, dict):
+        last_disconnect = {}
+    status = last_disconnect.get("status")
+    if isinstance(status, bool) or not isinstance(status, int):
+        status = None
+
+    flag = account.get("terminalDisconnect")
+    if not isinstance(flag, bool):
+        flag = channel.get("terminalDisconnect")
+    if isinstance(flag, bool):
+        return (flag or health == TERMINAL_DISCONNECT_HEALTH), status
+    return (health == TERMINAL_DISCONNECT_HEALTH or status == 401), status
+
+
 def check_whatsapp(timeout_ms: int, openclaw_bin: str) -> CheckResult:
     cmd = [
         openclaw_bin, "channels", "status",
@@ -302,14 +340,27 @@ def check_whatsapp(timeout_ms: int, openclaw_bin: str) -> CheckResult:
             "WhatsApp is configured, linked, running, connected, and healthy",
         )
 
+    terminal, last_disconnect_status = whatsapp_terminal_disconnect(account, channel, health)
     flags = {
         "configured": configured,
         "linked": linked,
         "running": running,
         "connected": connected,
         "healthState": health,
+        "terminalDisconnect": terminal,
+        "lastDisconnectStatus": last_disconnect_status,
         "lastError": account.get("lastError") or channel.get("lastError"),
     }
+    detail = json.dumps(flags, ensure_ascii=False, sort_keys=True)
+    if terminal:
+        # 與 whatsapp_unhealthy 分開，state 檔才判讀得出「這輪重啟不會有用」。
+        return CheckResult(
+            channel="whatsapp",
+            ok=False,
+            status=WHATSAPP_LOGGED_OUT_STATUS,
+            detail=detail,
+            suggested_next_step=WHATSAPP_LOGGED_OUT_NEXT_STEP,
+        )
     next_step = "Restart OpenClaw gateway to recover the WhatsApp session."
     if not linked:
         next_step = "WhatsApp appears unlinked; re-link with openclaw channels login --channel whatsapp."
@@ -317,7 +368,7 @@ def check_whatsapp(timeout_ms: int, openclaw_bin: str) -> CheckResult:
         channel="whatsapp",
         ok=False,
         status="whatsapp_unhealthy",
-        detail=json.dumps(flags, ensure_ascii=False, sort_keys=True),
+        detail=detail,
         suggested_next_step=next_step,
     )
 
@@ -471,7 +522,24 @@ def main() -> int:
         if unhealthy:
             key = incident_key(unhealthy)
             incident = active_incident(state, key)
-            if args.recovery_mode == "restart":
+            # 重啟對 terminal disconnect 必定無效，而且會連帶把 LINE/Telegram 彈掉。
+            # 但只有在**本輪全部的不健康項目都是**這種狀況時才跳過——若同時還有別的
+            # 頻道壞掉，重啟對那一個仍可能有用，不該連它的自動恢復一起取消。
+            restart_is_futile = all(
+                result.status == WHATSAPP_LOGGED_OUT_STATUS for result in unhealthy
+            )
+            if args.recovery_mode == "restart" and restart_is_futile:
+                recovery_result = CheckResult(
+                    "gateway", True, GATEWAY_RESTART_SKIPPED_STATUS,
+                    "WhatsApp session was logged out by the server; a gateway restart cannot "
+                    "recover it and would drop LINE/Telegram too. Notifying only.",
+                )
+                if args.notify:
+                    notified = maybe_notify(
+                        unhealthy, "notify", args.notify_bin,
+                        incident, args.cooldown_minutes,
+                    )
+            elif args.recovery_mode == "restart":
                 if not incident.get("restart_attempted_at"):
                     recovery_result = restart_gateway(args.openclaw_bin)
                     incident["restart_attempted_at"] = iso_now()

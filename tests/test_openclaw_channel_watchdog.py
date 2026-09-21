@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+
+import pytest
 import urllib.error
 from pathlib import Path
 
@@ -417,3 +419,195 @@ def test_restart_gateway_returns_failure_detail(monkeypatch):
     assert result.ok is False
     assert result.status == "gateway_restart_failed"
     assert "nope" in result.detail
+
+
+# ── #32: 被登出（terminal disconnect）與一般 unhealthy 的分流 ──────────────────
+
+# 2026-09-20 15:18 PT 實際被登出時 `openclaw channels status --probe --json` 的內容。
+# 注意 loggedOut 是 false、linked 仍是 true——所以不能靠它們判斷。
+LOGGED_OUT_PAYLOAD = {
+    "channels": {"whatsapp": {"configured": True}},
+    "channelAccounts": {
+        "whatsapp": [{
+            "configured": True,
+            "linked": True,
+            "running": True,
+            "connected": False,
+            "statusState": "linked",
+            "healthState": "terminal-disconnect",
+            "terminalDisconnect": True,
+            "lastDisconnect": {"status": 401, "loggedOut": False},
+        }]
+    },
+}
+
+PLAIN_UNHEALTHY_PAYLOAD = {
+    "channels": {"whatsapp": {"configured": True}},
+    "channelAccounts": {
+        "whatsapp": [{
+            "configured": True,
+            "linked": True,
+            "running": False,
+            "connected": False,
+            "statusState": "linked",
+            "healthState": "degraded",
+            "terminalDisconnect": False,
+        }]
+    },
+}
+
+
+def _probe(monkeypatch, payload):
+    monkeypatch.setattr(mod, "run_command",
+                        lambda cmd, timeout: _Proc(0, stdout=json.dumps(payload)))
+    return mod.check_whatsapp(timeout_ms=1000, openclaw_bin="/custom/openclaw")
+
+
+def test_logged_out_session_gets_its_own_status_and_a_relink_next_step(monkeypatch):
+    result = _probe(monkeypatch, LOGGED_OUT_PAYLOAD)
+
+    assert result.ok is False
+    assert result.status == "whatsapp_logged_out"
+    assert "重啟 gateway 無效" in result.suggested_next_step
+    assert "openclaw channels login --channel whatsapp" in result.suggested_next_step
+    assert "Restart OpenClaw gateway" not in result.suggested_next_step
+    flags = json.loads(result.detail)
+    assert flags["terminalDisconnect"] is True
+    assert flags["lastDisconnectStatus"] == 401
+
+
+def test_plain_unhealthy_session_still_suggests_a_restart(monkeypatch):
+    result = _probe(monkeypatch, PLAIN_UNHEALTHY_PAYLOAD)
+
+    assert result.status == "whatsapp_unhealthy"
+    assert result.suggested_next_step == "Restart OpenClaw gateway to recover the WhatsApp session."
+    flags = json.loads(result.detail)
+    assert flags["terminalDisconnect"] is False
+
+
+def test_health_state_alone_is_enough_when_the_flag_is_missing(monkeypatch):
+    payload = json.loads(json.dumps(LOGGED_OUT_PAYLOAD))
+    del payload["channelAccounts"]["whatsapp"][0]["terminalDisconnect"]
+    assert _probe(monkeypatch, payload).status == "whatsapp_logged_out"
+
+
+def test_stale_401_does_not_override_an_explicit_false_flag(monkeypatch):
+    """lastDisconnect 是歷史欄位：重新連結後那顆 401 還留著，不得蓋過現況。"""
+    payload = json.loads(json.dumps(PLAIN_UNHEALTHY_PAYLOAD))
+    payload["channelAccounts"]["whatsapp"][0]["lastDisconnect"] = {"status": 401, "loggedOut": False}
+    assert _probe(monkeypatch, payload).status == "whatsapp_unhealthy"
+
+
+def test_401_is_used_when_the_probe_has_no_terminal_flag_at_all(monkeypatch):
+    """舊版 gateway 沒給 terminalDisconnect → 才退回用 401 判斷。"""
+    payload = json.loads(json.dumps(PLAIN_UNHEALTHY_PAYLOAD))
+    del payload["channelAccounts"]["whatsapp"][0]["terminalDisconnect"]
+    payload["channelAccounts"]["whatsapp"][0]["lastDisconnect"] = {"status": 401}
+    assert _probe(monkeypatch, payload).status == "whatsapp_logged_out"
+
+
+def test_malformed_last_disconnect_is_ignored(monkeypatch):
+    payload = json.loads(json.dumps(PLAIN_UNHEALTHY_PAYLOAD))
+    del payload["channelAccounts"]["whatsapp"][0]["terminalDisconnect"]
+    for bad in ("nope", {"status": "401"}, {"status": True}, []):
+        payload["channelAccounts"]["whatsapp"][0]["lastDisconnect"] = bad
+        result = _probe(monkeypatch, payload)
+        assert result.status == "whatsapp_unhealthy", bad
+        assert json.loads(result.detail)["lastDisconnectStatus"] is None, bad
+
+
+def _watchdog_argv(tmp_path, state_file, config_file, notify_bin):
+    config_file.write_text("{}")
+    notify_bin.write_text("#!/bin/sh\nexit 0\n")
+    notify_bin.chmod(0o755)
+    return [
+        "watchdog",
+        "--channels", "whatsapp", "line",
+        "--notify",
+        "--recovery-mode", "restart",
+        "--state-file", str(state_file),
+        "--config-file", str(config_file),
+        "--notify-bin", str(notify_bin),
+        "--openclaw-bin", "openclaw",
+    ]
+
+
+def test_restart_mode_does_not_restart_a_logged_out_session(monkeypatch, tmp_path):
+    """重啟對 terminal disconnect 必定無效，而且會連帶把 LINE/Telegram 彈掉。"""
+    state_file, config_file = tmp_path / "state.json", tmp_path / "openclaw.json"
+    notify_bin = tmp_path / "notify-dm"
+    calls = {"evaluate": 0, "restart": 0, "notify": 0}
+
+    def fake_evaluate(*args, **kwargs):
+        calls["evaluate"] += 1
+        return [
+            mod.CheckResult("whatsapp", False, mod.WHATSAPP_LOGGED_OUT_STATUS,
+                            "{}", mod.WHATSAPP_LOGGED_OUT_NEXT_STEP),
+            mod.CheckResult("line", True, "healthy", "ok"),
+        ]
+
+    monkeypatch.setattr(mod, "evaluate_channels", fake_evaluate)
+    monkeypatch.setattr(mod, "restart_gateway",
+                        lambda *a, **k: calls.__setitem__("restart", calls["restart"] + 1))
+    monkeypatch.setattr(mod, "send_notification",
+                        lambda *a, **k: calls.__setitem__("notify", calls["notify"] + 1))
+    monkeypatch.setattr(sys, "argv", _watchdog_argv(tmp_path, state_file, config_file, notify_bin))
+
+    assert mod.main() == 1
+    assert calls["restart"] == 0, "被登出時不得重啟 gateway"
+    assert calls["evaluate"] == 1, "沒有重啟就不該有重啟後的重測"
+    assert calls["notify"] == 1
+    saved = json.loads(state_file.read_text())
+    assert saved["recovery"]["status"] == "gateway_restart_skipped_terminal_disconnect"
+    assert saved["recovery"]["ok"] is True
+
+
+def test_restart_still_happens_when_another_channel_is_also_broken(monkeypatch, tmp_path):
+    """只有在本輪全部不健康項目都是「被登出」時才跳過重啟——否則會取消別的頻道的自動恢復。"""
+    state_file, config_file = tmp_path / "state.json", tmp_path / "openclaw.json"
+    notify_bin = tmp_path / "notify-dm"
+    calls = {"evaluate": 0, "restart": 0}
+
+    def fake_evaluate(*args, **kwargs):
+        calls["evaluate"] += 1
+        return [
+            mod.CheckResult("whatsapp", False, mod.WHATSAPP_LOGGED_OUT_STATUS,
+                            "{}", mod.WHATSAPP_LOGGED_OUT_NEXT_STEP),
+            mod.CheckResult("line", False, "line_official_webhook_failed", "broken", "restart"),
+        ]
+
+    def fake_restart(openclaw_bin):
+        calls["restart"] += 1
+        return mod.CheckResult("gateway", True, "gateway_restart_ok", "restarted")
+
+    monkeypatch.setattr(mod, "evaluate_channels", fake_evaluate)
+    monkeypatch.setattr(mod, "restart_gateway", fake_restart)
+    monkeypatch.setattr(mod.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(mod, "send_notification", lambda *a, **k: None)
+    monkeypatch.setattr(sys, "argv", _watchdog_argv(tmp_path, state_file, config_file, notify_bin))
+
+    assert mod.main() == 1
+    assert calls["restart"] == 1, "LINE 也壞掉時，重啟對它仍可能有用，不該一起取消"
+    saved = json.loads(state_file.read_text())
+    assert saved["recovery"]["status"] == "gateway_restart_ok"
+
+
+def test_logged_out_alert_says_notify_only_not_restart(monkeypatch, tmp_path):
+    """DM 的 Recovery mode 那行不能說「restart once」——這輪根本沒有也不會重啟。"""
+    state_file, config_file = tmp_path / "state.json", tmp_path / "openclaw.json"
+    notify_bin = tmp_path / "notify-dm"
+    messages = []
+
+    monkeypatch.setattr(mod, "evaluate_channels", lambda *a, **k: [
+        mod.CheckResult("whatsapp", False, mod.WHATSAPP_LOGGED_OUT_STATUS,
+                        "{}", mod.WHATSAPP_LOGGED_OUT_NEXT_STEP),
+    ])
+    monkeypatch.setattr(mod, "restart_gateway", lambda *a, **k: pytest.fail("不該重啟"))
+    monkeypatch.setattr(mod, "send_notification", lambda message, notify_bin: messages.append(message))
+    monkeypatch.setattr(sys, "argv", _watchdog_argv(tmp_path, state_file, config_file, notify_bin))
+
+    assert mod.main() == 1
+    (message,) = messages
+    assert "重啟 gateway 無效" in message
+    assert "Recovery mode: notify-only." in message
+    assert "restart once" not in message
