@@ -74,6 +74,23 @@ unaffected). Throttled to **at most one email per channel per day** (state in
 `~/.openclaw/notify/failure-alert.state.json`, override `$NOTIFY_ALERT_STATE`)
 so a persistently-failing channel does not spam.
 
+### What the alert email contains
+
+Every alert names the route, the time, and the **host / pid / caller** — the
+parent command that invoked the shim. Set `$NOTIFY_CALLER` to name a job
+explicitly (a launchd label reads better than `/bin/sh -c …`).
+
+Each failed channel line carries the command's **exit code** plus an excerpt of
+its output, truncated from the **end**. `openclaw` prints a multi-kilobyte
+box-drawing advisory banner on stdout before doing any work, so keeping the
+*head* of the output (the behaviour before notify-shim#34) showed nothing but
+that banner and hid the actual error. Banner frames are stripped outright.
+
+A `Diagnostics:` section appears when the run was recorded incompletely — a
+failed send-ledger append, or a throttle water-mark that cannot be persisted
+(in which case repeat alerts are expected, and the email says so instead of
+leaving the reader to wonder why the daily limit stopped holding).
+
 ## Config (`routes.json`)
 
 Real chat/user/group IDs are **not** in this repo. They live in a local,
