@@ -449,3 +449,139 @@ def test_ledger_ts_has_microsecond_precision(monkeypatch, routes_file):
 
     ts = json.loads(Path(notify_core.ledger_path()).read_text().splitlines()[0])["ts"]
     assert re.search(r"T\d{2}:\d{2}:\d{2}\.\d{6}", ts), ts  # fractional seconds present
+
+
+# --------------------------------------------------------------------------- #
+# notify-shim#34 — the alert must carry the real cause, not openclaw's banner
+# --------------------------------------------------------------------------- #
+
+# A realistic openclaw advisory banner: box-drawing frames, long enough that
+# head-truncation at 500 chars would show nothing but this.
+BANNER = "\n".join([
+    "╭",
+    "◇  Update history ──────────────────────────────────────────────╮",
+    "│                                                                │",
+    "│  Recorded warnings from update 0f7c6c5c-543f-430f-af2f-e566    │",
+    "│  (a later repair may have resolved them):                      │",
+    "│  Plugin \"codex\" state migration is pending: The plugin has     │",
+    "│  not reported completion of its retained state migration.      │",
+    "│  State and legacy config inputs are preserved. Run             │",
+    "│  \"openclaw update repair\", then \"openclaw doctor --fix\".       │",
+    "│                                                                │",
+    "├────────────────────────────────────────────────────────────────╯",
+])
+REAL_ERROR = ("[state/db] EPERM: operation not permitted, "
+              "chmod '/Users/claw/.openclaw/state'")
+
+
+def _run_with_banner(fail_target):
+    """openclaw prints its banner on stdout and the fatal error last on stderr."""
+    def _run(cmd, capture_output=False, text=False, env=None, timeout=None):
+        target = cmd[cmd.index("--target") + 1]
+        if target == fail_target:
+            return FakeProc(1, stdout=BANNER, stderr=REAL_ERROR)
+        return FakeProc(0, stdout="✅ sent")
+    return _run
+
+
+def test_alert_detail_survives_banner_and_names_exit_code(
+        monkeypatch, routes_file, alert_config):
+    monkeypatch.setattr(notify_core.subprocess, "run", _run_with_banner("Uabc"))
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    assert notify_core.main(["--route", "dm", "-m", "hi",
+                             "--routes", routes_file]) == 0
+    body = alert_config[0]["body"]
+    assert "EPERM" in body                 # the cause reaches the reader
+    assert "exit 1" in body                # ...with the exit code
+    assert "Update history" not in body    # ...and without the banner
+    assert "state migration is pending" not in body
+
+
+def test_banner_only_output_still_reports_exit_code(monkeypatch, routes_file,
+                                                    alert_config):
+    """A failure whose entire output is banner must not produce an empty
+    detail — the exit code alone is still actionable."""
+    def _run(cmd, capture_output=False, text=False, env=None, timeout=None):
+        target = cmd[cmd.index("--target") + 1]
+        if target == "Uabc":
+            return FakeProc(3, stdout=BANNER)
+        return FakeProc(0, stdout="✅ sent")
+
+    monkeypatch.setattr(notify_core.subprocess, "run", _run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    assert notify_core.main(["--route", "dm", "-m", "hi",
+                             "--routes", routes_file]) == 0
+    assert "exit 3 (no output)" in alert_config[0]["body"]
+
+
+def test_alert_names_host_pid_and_caller(monkeypatch, routes_file, alert_config):
+    monkeypatch.setenv("NOTIFY_CALLER", "com.openclaw.channel-watchdog")
+    run = make_run(fail_targets={"Uabc"})
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    assert notify_core.main(["--route", "dm", "-m", "hi",
+                             "--routes", routes_file]) == 0
+    body = alert_config[0]["body"]
+    assert "com.openclaw.channel-watchdog" in body
+    assert f"pid {os.getpid()}" in body
+    assert "Host:" in body
+
+
+def test_ledger_failure_reaches_the_alert_body(monkeypatch, routes_file,
+                                               tmp_path, alert_config):
+    """A swallowed ledger append used to be visible only on a stderr nobody
+    tails; the alert must say the run was recorded incompletely."""
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("NOTIFY_LEDGER", str(blocker / "ledger.jsonl"))
+    run = make_run(fail_targets={"Uabc"})
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    assert notify_core.main(["--route", "dm", "-m", "hi",
+                             "--routes", routes_file]) == 0
+    body = alert_config[0]["body"]
+    assert "Diagnostics:" in body
+    assert "send-ledger append failed" in body
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses directory perms")
+def test_unwritable_throttle_state_warns_about_repeats(monkeypatch, routes_file,
+                                                       tmp_path, alert_config):
+    readonly = tmp_path / "readonly"
+    readonly.mkdir()
+    monkeypatch.setenv("NOTIFY_ALERT_STATE", str(readonly / "alert.state.json"))
+    readonly.chmod(0o500)
+    try:
+        run = make_run(fail_targets={"Uabc"})
+        monkeypatch.setattr(notify_core.subprocess, "run", run)
+        monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+        assert notify_core.main(["--route", "dm", "-m", "hi",
+                                 "--routes", routes_file]) == 0
+        body = alert_config[0]["body"]
+        assert "throttle water-mark is not persistable" in body
+        assert "expect repeat alerts" in body
+    finally:
+        readonly.chmod(0o700)  # let tmp_path cleanup run
+
+
+def test_probe_writable_leaves_no_residue(tmp_path):
+    target = tmp_path / "state.json"
+    ok, detail = notify_core._probe_writable(str(target))
+    assert ok and detail == ""
+    assert list(tmp_path.iterdir()) == []  # probe file cleaned up
+
+
+def test_caller_line_keeps_the_head_of_a_long_command(monkeypatch):
+    """A caller is identified by the program that starts its command line, so
+    a long invocation must be truncated from the end, not the front."""
+    monkeypatch.setenv("NOTIFY_CALLER",
+                       "/usr/bin/python3 /path/to/openclaw_channel_watchdog.py "
+                       + "--flag " * 60)
+    line = notify_core._describe_caller()
+    assert "openclaw_channel_watchdog.py" in line
+    assert line.rstrip().endswith("…")

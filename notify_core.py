@@ -31,6 +31,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -149,24 +150,99 @@ def _send_alert_email(cfg, subject: str, body: str, *, timeout: int = 30):
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 # C0 control characters except tab/newline, plus DEL — also unsafe in a body.
 _CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+# openclaw frames its advisory banners ("◇ Update history", "◇ Doctor warnings"
+# …) in box-drawing characters, and every line of such a block starts with a
+# frame glyph. Those banners replay past status, not the failure being
+# reported, and they are long enough to consume the whole excerpt budget on
+# their own — notify-shim#34: a 2.8 KB banner left every alert unreadable.
+_BANNER_LINE_RE = re.compile(
+    r"^[\s\u2500-\u257f\u25c6-\u25c8]*[\u2500-\u257f\u25c6-\u25c8]")
+# Per-channel excerpt budget. The alert formatter re-sanitizes with headroom so
+# the "exit N: " prefix that send_one puts in front survives that second pass.
+_DETAIL_LIMIT = 420
+_ALERT_DETAIL_LIMIT = _DETAIL_LIMIT + 100
 
 
-def _sanitize_for_email(text: str, *, limit: int = 500) -> str:
-    """Strip ANSI escapes and control characters so the alert body is plain,
-    deliverable text (notify-shim#28). Collapses runs of whitespace to keep the
-    multi-line openclaw doctor-notice noise to one readable line, and truncates
-    to keep the email tidy."""
+def _strip_openclaw_banners(text: str) -> str:
+    """Drop openclaw's box-drawing banner lines, keeping real output."""
+    return "\n".join(line for line in (text or "").splitlines()
+                      if not _BANNER_LINE_RE.match(line))
+
+
+def _sanitize_for_email(text: str, *, limit: int = 500,
+                        keep: str = "tail") -> str:
+    """Strip ANSI escapes, control characters and openclaw's banner frames so
+    the alert body is plain, deliverable text (notify-shim#28, #34).
+
+    Truncation keeps the **tail** by default: a command's fatal error lands at
+    the end of its output, behind whatever advisory noise the CLI printed
+    first. Keeping the head (the old behaviour) meant the reader only ever saw
+    the banner. Pass ``keep="head"`` for text that reads front-to-back, such as
+    a caller's command line, where the program name comes first.
+    """
     clean = _ANSI_RE.sub("", text or "")
     clean = _CTRL_RE.sub("", clean)
+    clean = _strip_openclaw_banners(clean)
     clean = re.sub(r"\s+", " ", clean).strip()
     if len(clean) > limit:
-        clean = clean[:limit].rstrip() + "…"
+        clean = (clean[:limit].rstrip() + "…" if keep == "head"
+                 else "…" + clean[-limit:].lstrip())
     return clean
 
 
-def maybe_send_failure_alert(route: str, results, *, dry_run: bool) -> None:
+def _describe_caller() -> str:
+    """Best-effort one-line identity of whatever invoked this shim.
+
+    An alert that only names the failing channel cannot say *which* job hit it,
+    leaving the reader to correlate timestamps across logs (notify-shim#34).
+    ``NOTIFY_CALLER`` lets a caller name itself. Never raises — a diagnostic
+    helper must not be able to break the alert it is annotating.
+    """
+    try:
+        host = socket.gethostname()
+    except OSError:
+        host = "?"
+    caller = os.environ.get("NOTIFY_CALLER", "").strip()
+    if not caller:
+        try:
+            proc = subprocess.run(["ps", "-o", "args=", "-p", str(os.getppid())],
+                                  capture_output=True, text=True, timeout=5)
+            caller = (proc.stdout.strip().splitlines()[0]
+                      if proc.returncode == 0 and proc.stdout.strip() else "")
+        except Exception:
+            caller = ""
+    return (f"Host: {host} | pid {os.getpid()} | caller: "
+            f"{_sanitize_for_email(caller, limit=160, keep='head') or 'unknown'}")
+
+
+def _probe_writable(path: str):
+    """Return ``(ok, detail)`` for whether ``path`` can be written.
+
+    The throttle water-mark is written *after* the email goes out, so a failure
+    there can never appear in the alert it belongs to. Probing first lets that
+    alert say "expect repeats" in the same message (notify-shim#34).
+    """
+    try:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        probe = target.with_name(target.name + ".probe")
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return True, ""
+    except OSError as exc:
+        return False, str(exc)
+
+
+def maybe_send_failure_alert(route: str, results, *, dry_run: bool,
+                             notes=None) -> None:
     """Best-effort email when one or more channels failed, throttled to one
-    email per channel per day. Never raises."""
+    email per channel per day. Never raises.
+
+    ``notes`` carries diagnostics gathered earlier in the run (e.g. a failed
+    send-ledger append). They used to go only to stderr, which for a launchd or
+    cron caller is a log nobody tails — so a half-broken run looked
+    clean (notify-shim#34).
+    """
     failed = [(ch, tgt, detail) for (ch, tgt, ok, detail) in results if not ok]
     if not failed or dry_run:
         return
@@ -186,10 +262,22 @@ def maybe_send_failure_alert(route: str, results, *, dry_run: bool) -> None:
     fresh = [f for f in failed if state.get(f[0]) != today]
     if not fresh:  # every failed channel already alerted today
         return
+    diagnostics = list(notes or [])
+    throttle_ok, throttle_err = _probe_writable(alert_state_path())
+    if not throttle_ok:
+        diagnostics.append(
+            f"throttle water-mark is not persistable ({throttle_err}) — "
+            f"the one-email-per-channel-per-day limit cannot hold, so "
+            f"expect repeat alerts until that path is writable")
     lines = [f"Route: {route}", f"Time: {dt.datetime.now().astimezone().isoformat()}",
+             _describe_caller(),
              "", "Failed channel(s):"]
-    lines += [f"  - {ch}:{tgt} — {_sanitize_for_email(detail)}"
+    lines += [f"  - {ch}:{tgt} — "
+              f"{_sanitize_for_email(detail, limit=_ALERT_DETAIL_LIMIT)}"
               for (ch, tgt, detail) in failed]
+    if diagnostics:
+        lines += ["", "Diagnostics:"]
+        lines += [f"  - {_sanitize_for_email(note)}" for note in diagnostics]
     lines += ["", "Other channels on this route delivered normally (the message "
               "was not lost) unless this route has only failed channels.",
               "Fix the failing channel (e.g. re-link WhatsApp / restart the "
@@ -213,7 +301,7 @@ def maybe_send_failure_alert(route: str, results, *, dry_run: bool) -> None:
           f"({len(fresh)} channel(s))", file=sys.stderr)
 
 
-def _record_ledger(route: str, results, *, dry_run: bool) -> None:
+def _record_ledger(route: str, results, *, dry_run: bool, notes=None) -> None:
     """Best-effort append of one send record; never raises.
 
     A downstream digest (e.g. the couple-group evening email nudge) reads this
@@ -245,8 +333,11 @@ def _record_ledger(route: str, results, *, dry_run: bool) -> None:
         # Never break delivery — but don't fail silently either: the couple-group
         # nudge relies on this ledger as its only source of truth, so a lost
         # append must at least be visible in logs.
-        print(f"notify: send-ledger append failed ({exc}); "
-              f"'{route}' event not recorded", file=sys.stderr)
+        message = (f"send-ledger append failed ({exc}); "
+                   f"'{route}' event not recorded")
+        print(f"notify: {message}", file=sys.stderr)
+        if notes is not None:
+            notes.append(message)
 
 
 def find_openclaw() -> str:
@@ -291,6 +382,24 @@ def _env_with_binary_on_path(binary: str) -> dict:
     return env
 
 
+def _command_detail(proc) -> str:
+    """Summarise a finished ``openclaw`` call for humans.
+
+    stdout goes first and stderr last because the excerpt is truncated from the
+    end: openclaw prints its advisory banner on stdout while the fatal error
+    lands on stderr, so keeping the tail keeps the part that explains the
+    failure. The exit code is prefixed *after* truncation so it always shows
+    (notify-shim#34).
+    """
+    body = _sanitize_for_email(
+        "\n".join(part for part in (proc.stdout or "", proc.stderr or "")
+                   if part.strip()),
+        limit=_DETAIL_LIMIT)
+    if proc.returncode == 0:
+        return body
+    return f"exit {proc.returncode}: {body}" if body else f"exit {proc.returncode} (no output)"
+
+
 def send_one(channel: str, target: str, message: str, *, dry_run: bool,
              openclaw_bin: str | None = None, timeout: int = 60):
     """Send to one channel. Return ``(ok: bool, detail: str)`` — never raises.
@@ -314,12 +423,11 @@ def send_one(channel: str, target: str, message: str, *, dry_run: bool,
         return False, f"timed out after {timeout}s"
     except OSError as exc:
         return False, f"could not run openclaw ({exc})"
-    detail = (proc.stdout + proc.stderr).strip()
-    return proc.returncode == 0, detail
+    return proc.returncode == 0, _command_detail(proc)
 
 
 def notify(route: str, message: str, *, routes_path: str | None = None,
-           dry_run: bool = False):
+           dry_run: bool = False, notes=None):
     """Fan ``message`` out to every channel of ``route``.
 
     Returns a list of ``(channel, target, ok, detail)`` tuples.
@@ -343,7 +451,7 @@ def notify(route: str, message: str, *, routes_path: str | None = None,
             ch["channel"], ch["target"], message, dry_run=dry_run
         )
         results.append((ch["channel"], ch["target"], ok, detail))
-    _record_ledger(route, results, dry_run=dry_run)
+    _record_ledger(route, results, dry_run=dry_run, notes=notes)
     return results
 
 
@@ -373,9 +481,11 @@ def main(argv=None) -> int:
         print("notify: empty message", file=sys.stderr)
         return 2
 
+    notes: list[str] = []
     try:
         results = notify(args.route, message,
-                         routes_path=args.routes, dry_run=args.dry_run)
+                         routes_path=args.routes, dry_run=args.dry_run,
+                         notes=notes)
     except (FileNotFoundError, KeyError, ValueError) as exc:
         print(f"notify: {exc}", file=sys.stderr)
         return 2
@@ -395,7 +505,8 @@ def main(argv=None) -> int:
         print(line, file=sys.stderr)
 
     if failed:
-        maybe_send_failure_alert(args.route, results, dry_run=args.dry_run)
+        maybe_send_failure_alert(args.route, results, dry_run=args.dry_run,
+                                 notes=notes)
         print(
             f"notify: {len(failed)}/{len(results)} channel(s) FAILED "
             f"for route '{args.route}'",
