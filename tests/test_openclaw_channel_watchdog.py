@@ -633,6 +633,10 @@ def test_notify_timeout_covers_every_enabled_channel(monkeypatch, tmp_path):
 
     budget = notify_core.route_send_budget("dm")
     assert budget > 2 * notify_core.SEND_TIMEOUT_SECONDS  # both channels + overhead
+    assert budget > (
+        2 * notify_core.SEND_TIMEOUT_SECONDS
+        + notify_core.ALERT_EMAIL_TIMEOUT_SECONDS
+    )
     assert mod.notify_timeout_seconds() == budget
 
 

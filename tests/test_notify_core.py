@@ -576,6 +576,42 @@ def test_probe_writable_leaves_no_residue(tmp_path):
     assert list(tmp_path.iterdir()) == []  # probe file cleaned up
 
 
+def test_probe_for_missing_target_never_creates_the_real_path(tmp_path, monkeypatch):
+    target = tmp_path / "state.json"
+    opened = []
+    real_open = notify_core.os.open
+
+    def recording_open(path, flags, mode):
+        opened.append(Path(path))
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(notify_core.os, "open", recording_open)
+    assert notify_core._probe_writable(str(target))[0]
+    assert target not in opened
+    assert not target.exists()
+
+
+def test_probe_writable_rejects_existing_directory(tmp_path):
+    target = tmp_path / "state.json"
+    target.mkdir()
+    ok, detail = notify_core._probe_writable(str(target))
+    assert not ok
+    assert "directory" in detail.lower()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root bypasses file perms")
+def test_probe_writable_rejects_read_only_file_without_changing_it(tmp_path):
+    target = tmp_path / "state.json"
+    target.write_text("keep me", encoding="utf-8")
+    target.chmod(0o400)
+    try:
+        ok, _detail = notify_core._probe_writable(str(target))
+        assert not ok
+        assert target.read_text(encoding="utf-8") == "keep me"
+    finally:
+        target.chmod(0o600)
+
+
 def test_caller_line_keeps_the_head_of_a_long_command(monkeypatch):
     """A caller is identified by the program that starts its command line, so
     a long invocation must be truncated from the end, not the front."""
