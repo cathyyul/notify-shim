@@ -576,6 +576,21 @@ def test_probe_writable_leaves_no_residue(tmp_path):
     assert list(tmp_path.iterdir()) == []  # probe file cleaned up
 
 
+def test_probe_for_missing_target_never_creates_the_real_path(tmp_path, monkeypatch):
+    target = tmp_path / "state.json"
+    opened = []
+    real_open = notify_core.os.open
+
+    def recording_open(path, flags, mode):
+        opened.append(Path(path))
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(notify_core.os, "open", recording_open)
+    assert notify_core._probe_writable(str(target))[0]
+    assert target not in opened
+    assert not target.exists()
+
+
 def test_probe_writable_rejects_existing_directory(tmp_path):
     target = tmp_path / "state.json"
     target.mkdir()

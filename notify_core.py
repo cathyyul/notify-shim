@@ -238,9 +238,14 @@ def _probe_writable(path: str):
             with target.open("r+", encoding="utf-8"):
                 pass
         else:
-            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            # No target exists yet, so its own permissions cannot differ from
+            # the parent. Probe a unique sibling instead of briefly creating
+            # the real path: another process may be its legitimate first
+            # writer, and probe cleanup must never unlink that writer's state.
+            probe = target.with_name(f"{target.name}.probe.{os.getpid()}")
+            fd = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             os.close(fd)
-            target.unlink()
+            probe.unlink()
         return True, ""
     except OSError as exc:
         return False, str(exc)
