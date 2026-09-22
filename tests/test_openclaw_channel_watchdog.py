@@ -611,3 +611,55 @@ def test_logged_out_alert_says_notify_only_not_restart(monkeypatch, tmp_path):
     assert "重啟 gateway 無效" in message
     assert "Recovery mode: notify-only." in message
     assert "restart once" not in message
+
+
+# --------------------------------------------------------------------------- #
+# notify-shim#35 — the alert must outlive a slow gateway, and say so if it does not
+# --------------------------------------------------------------------------- #
+
+def test_notify_timeout_covers_every_enabled_channel(monkeypatch, tmp_path):
+    """A two-channel route can legitimately take 2 x the per-channel deadline;
+    the watchdog's budget must exceed that, not the old flat 30s."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import notify_core
+
+    routes = tmp_path / "routes.json"
+    routes.write_text(json.dumps({"dm": {"channels": [
+        {"channel": "telegram", "target": "1"},
+        {"channel": "whatsapp", "target": "2"},
+        {"channel": "line", "target": "3", "enabled": False},
+    ]}}), encoding="utf-8")
+    monkeypatch.setenv("NOTIFY_ROUTES", str(routes))
+
+    budget = notify_core.route_send_budget("dm")
+    assert budget > 2 * notify_core.SEND_TIMEOUT_SECONDS  # both channels + overhead
+    assert mod.notify_timeout_seconds() == budget
+
+
+def test_notify_budget_falls_back_when_routes_unreadable(monkeypatch, tmp_path):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import notify_core
+
+    monkeypatch.setenv("NOTIFY_ROUTES", str(tmp_path / "nope.json"))
+    monkeypatch.setattr(notify_core.Path, "home", lambda: tmp_path)
+    # One channel's worth of budget — never zero, so a send still gets a chance.
+    assert notify_core.route_send_budget("dm") >= notify_core.SEND_TIMEOUT_SECONDS
+
+
+def test_timed_out_notify_is_reported_as_an_undelivered_alert(
+        monkeypatch, tmp_path, capsys):
+    shim = tmp_path / "notify-dm"
+    shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+
+    def _boom(cmd, timeout):
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(mod, "run_command", _boom)
+    monkeypatch.setattr(mod, "notify_timeout_seconds", lambda route="dm": 42)
+
+    mod.send_notification("LINE unhealthy\nmore detail", shim)
+
+    err = capsys.readouterr().err
+    assert "ALERT NOT DELIVERED" in err
+    assert "42s" in err
+    assert "LINE unhealthy" in err  # what was lost, not just that it failed
