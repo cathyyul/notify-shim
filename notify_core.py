@@ -124,7 +124,12 @@ def find_gog() -> str:
     return "gog"
 
 
-def _send_alert_email(cfg, subject: str, body: str, *, timeout: int = 30):
+ALERT_EMAIL_TIMEOUT_SECONDS = 30
+EXECUTION_MARGIN_SECONDS = 10
+
+
+def _send_alert_email(cfg, subject: str, body: str, *,
+                      timeout: int = ALERT_EMAIL_TIMEOUT_SECONDS):
     """Send the failure alert via gog. Return ``(ok, detail)`` — never raises,
     so a stalled/absent gog becomes a failed-send result, not a crash. A bounded
     timeout stops a wedged gog from hanging the notify call."""
@@ -225,9 +230,17 @@ def _probe_writable(path: str):
     try:
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        probe = target.with_name(target.name + ".probe")
-        probe.write_text("", encoding="utf-8")
-        probe.unlink()
+        if target.exists():
+            if not target.is_file():
+                return False, f"target is a directory: {target}"
+            # Opening read/write checks the target's own permissions without
+            # truncating or modifying its existing contents.
+            with target.open("r+", encoding="utf-8"):
+                pass
+        else:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(fd)
+            target.unlink()
         return True, ""
     except OSError as exc:
         return False, str(exc)
@@ -407,7 +420,7 @@ SEND_TIMEOUT_SECONDS = 60
 
 
 def route_send_budget(route: str, *, routes_path: str | None = None,
-                      overhead: int = 30) -> int:
+                      overhead: int | None = None) -> int:
     """Worst-case wall-clock a ``notify_core`` run of ``route`` can take.
 
     A caller that wraps the shim in ``subprocess.run(..., timeout=X)`` with a
@@ -419,6 +432,8 @@ def route_send_budget(route: str, *, routes_path: str | None = None,
     Falls back to a single channel's budget when the routes file cannot be
     read — a diagnostic helper must not become a new failure mode.
     """
+    if overhead is None:
+        overhead = ALERT_EMAIL_TIMEOUT_SECONDS + EXECUTION_MARGIN_SECONDS
     try:
         routes, _used = load_routes(routes_path)
         channels = [ch for ch in routes.get(route, {}).get("channels", [])
