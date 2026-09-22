@@ -36,6 +36,10 @@ WORKSPACE = Path.home() / ".openclaw" / "workspace"
 DEFAULT_STATE_FILE = WORKSPACE / "data" / "health" / "openclaw-channel-watchdog.json"
 DEFAULT_CONFIG_FILE = Path.home() / ".openclaw" / "openclaw.json"
 DEFAULT_NOTIFY_DM_BIN = WORKSPACE / "scripts" / "notify-dm"
+#: Used only when notify_core cannot be imported to state its own budget.
+#: Generous on purpose: over-waiting costs a slow watchdog tick, while
+#: under-waiting costs the alert entirely (notify-shim#35).
+FALLBACK_NOTIFY_TIMEOUT_SECONDS = 300
 
 
 @dataclass
@@ -424,12 +428,41 @@ def active_incident(state: dict[str, Any], key: str) -> dict[str, Any]:
     }
 
 
+def notify_timeout_seconds(route: str = "dm") -> int:
+    """Wall-clock budget to give notify-dm, asked of notify_core itself.
+
+    This watchdog notifies right after it restarts the gateway, which is
+    exactly when ``openclaw message send`` is slowest, so a too-small timeout
+    kills the alert every single time it matters. Never raises: a helper that
+    cannot answer must not stop the alert from being attempted
+    (notify-shim#35).
+    """
+    try:
+        sys.path.insert(0, str(DEFAULT_NOTIFY_DM_BIN.parent))
+        import notify_core  # noqa: PLC0415 - optional, resolved at call time
+
+        return notify_core.route_send_budget(route)
+    except Exception:
+        return FALLBACK_NOTIFY_TIMEOUT_SECONDS
+
+
 def send_notification(message: str, notify_bin: Path) -> None:
     try:
         if not notify_bin.exists():
             print(f"notify: shim not found at {notify_bin}", file=sys.stderr)
             return
-        proc = run_command([str(notify_bin), message], timeout=30)
+        timeout = notify_timeout_seconds()
+        try:
+            proc = run_command([str(notify_bin), message], timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Say the alert was LOST, not just that a command misbehaved: the
+            # operator has to know nothing reached them (notify-shim#35).
+            print(f"notify: ALERT NOT DELIVERED — notify-dm exceeded "
+                  f"{timeout}s and was killed; the channel-health alert did not "
+                  f"reach anyone. First line was: "
+                  f"{message.splitlines()[0] if message else ''}",
+                  file=sys.stderr)
+            return
         if proc.returncode != 0:
             detail = (proc.stdout + proc.stderr).strip()
             print(f"notify: notify-dm exited {proc.returncode}: {detail}",

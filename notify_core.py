@@ -400,8 +400,37 @@ def _command_detail(proc) -> str:
     return f"exit {proc.returncode}: {body}" if body else f"exit {proc.returncode} (no output)"
 
 
+#: Per-channel deadline for one ``openclaw message send``. Callers that wrap
+#: the shim in their own timeout must budget for *every* enabled channel hitting
+#: this, not just one — see ``route_send_budget`` (notify-shim#35).
+SEND_TIMEOUT_SECONDS = 60
+
+
+def route_send_budget(route: str, *, routes_path: str | None = None,
+                      overhead: int = 30) -> int:
+    """Worst-case wall-clock a ``notify_core`` run of ``route`` can take.
+
+    A caller that wraps the shim in ``subprocess.run(..., timeout=X)`` with a
+    guessed X kills delivery mid-flight: the channel-watchdog used 30s while a
+    two-channel route can legitimately take 120s, so its alerts were killed
+    every time and never reached anyone (notify-shim#35). Ask here instead of
+    writing a second number.
+
+    Falls back to a single channel's budget when the routes file cannot be
+    read — a diagnostic helper must not become a new failure mode.
+    """
+    try:
+        routes, _used = load_routes(routes_path)
+        channels = [ch for ch in routes.get(route, {}).get("channels", [])
+                    if ch.get("enabled", True)]
+    except (FileNotFoundError, OSError, ValueError):
+        channels = []
+    return max(len(channels), 1) * SEND_TIMEOUT_SECONDS + overhead
+
+
 def send_one(channel: str, target: str, message: str, *, dry_run: bool,
-             openclaw_bin: str | None = None, timeout: int = 60):
+             openclaw_bin: str | None = None,
+             timeout: int = SEND_TIMEOUT_SECONDS):
     """Send to one channel. Return ``(ok: bool, detail: str)`` — never raises.
 
     A bounded timeout plus catching every OSError (not just a missing binary)
