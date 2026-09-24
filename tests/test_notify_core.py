@@ -147,6 +147,31 @@ def test_partial_failure_sends_throttled_alert(monkeypatch, routes_file, alert_c
     assert len(alert_config) == 1  # still one
 
 
+def test_alert_body_ends_with_static_fix_guide(monkeypatch, routes_file, alert_config):
+    # notify-shim#41: the closing advice used to always say "re-link WhatsApp /
+    # restart the gateway", which is wrong when the openclaw CLI dies before
+    # reaching the gateway. It is now a static lookup list the reader matches
+    # against the detail above — no classification of the detail.
+    run = make_run(fail_targets={"Uabc"})
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    assert notify_core.main(["--route", "dm", "-m", "hi", "--routes", routes_file]) == 0
+    body = alert_config[0]["body"]
+    assert ("Other channels on this route delivered normally (the message "
+            "was not lost) unless this route has only failed channels.") in body
+    assert "re-link WhatsApp / restart the gateway" not in body
+    for line in notify_core.ALERT_FIX_GUIDE:
+        assert line in body.splitlines()
+    guide = "\n".join(notify_core.ALERT_FIX_GUIDE)
+    for needle in ("temp dir", "write permission", "no effect",
+                   "logged out", "401", "openclaw channels login",
+                   "connection refused", "timeout", "restart the gateway",
+                   "detail above"):
+        assert needle in guide
+    assert body.endswith(notify_core.ALERT_FIX_GUIDE[-1])
+
+
 def test_alert_body_strips_ansi_and_control_chars(monkeypatch, routes_file, alert_config):
     # notify-shim#28: a failing channel's detail carries openclaw's ANSI/control
     # noise; raw ESC bytes in the body get the email silently dropped by Gmail.
