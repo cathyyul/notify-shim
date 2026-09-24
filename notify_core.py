@@ -167,6 +167,22 @@ _BANNER_LINE_RE = re.compile(
 _DETAIL_LIMIT = 420
 _ALERT_DETAIL_LIMIT = _DETAIL_LIMIT + 100
 
+# Closing advice of the failure-alert email: a static lookup list the reader
+# matches against the detail above. Deliberately no classification of the
+# detail (Yuting 2026-09-23, notify-shim#41): openclaw error strings drift
+# across upgrades, and the old unconditional "re-link WhatsApp / restart the
+# gateway" was wrong whenever the CLI died before reaching the gateway.
+ALERT_FIX_GUIDE = (
+    "Match the detail above to the fix (delivery resumes automatically once "
+    "fixed):",
+    "  - temp dir / other CLI start-up error → check the caller's environment "
+    "and write permission (e.g. a sandbox writable dir); re-linking or "
+    "restarting the gateway has no effect",
+    "  - logged out / 401 → re-link that channel: openclaw channels login",
+    "  - connection refused / timeout → restart the gateway",
+    "  - anything else → troubleshoot from the detail above",
+)
+
 
 def _strip_openclaw_banners(text: str) -> str:
     """Drop openclaw's box-drawing banner lines, keeping real output."""
@@ -298,8 +314,8 @@ def maybe_send_failure_alert(route: str, results, *, dry_run: bool,
         lines += [f"  - {_sanitize_for_email(note)}" for note in diagnostics]
     lines += ["", "Other channels on this route delivered normally (the message "
               "was not lost) unless this route has only failed channels.",
-              "Fix the failing channel (e.g. re-link WhatsApp / restart the "
-              "gateway), then delivery resumes automatically."]
+              ""]
+    lines += ALERT_FIX_GUIDE
     subject = f"[notify] {len(failed)} channel(s) failed on route '{route}'"
     ok, detail = _send_alert_email(cfg, subject, "\n".join(lines))
     if not ok:
