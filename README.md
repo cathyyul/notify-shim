@@ -18,6 +18,7 @@ change.
 |------|-------|--------------------|
 | `notify-dm` | `dm` | Telegram DM + LINE DM |
 | `notify-group-couple` | `group-couple` | Telegram `小寶murmur` + LINE `海老群` |
+| `notify-group-family` | `group-family` | LINE `尤家人` |
 
 Naming convention: a future group gets its own shim `notify-group-<name>` backed
 by a matching route in `routes.json`.
@@ -28,6 +29,7 @@ by a matching route in `routes.json`.
 notify-dm "晚餐時間到了 🍽️"
 echo "multi-line\nbody" | notify-dm
 notify-group-couple "這週要買的東西…"
+notify-group-family --dry-run "尤家人群預覽"
 notify-dm --dry-run "preview, nothing is sent"
 ```
 
@@ -112,6 +114,12 @@ gitignored file (default `~/.openclaw/notify/routes.json`). The repo ships
       { "channel": "telegram", "target": "<telegram group id>" },
       { "channel": "line", "target": "<line group id>" }
     ]
+  },
+  "group-family": {
+    "description": "Yuting family group — LINE 尤家人",
+    "channels": [
+      { "channel": "line", "target": "<line family group id>" }
+    ]
   }
 }
 ```
@@ -158,7 +166,7 @@ channel (Telegram chat id, LINE userId/groupId — no prefix).
 ./deploy.sh
 ```
 
-Installs `notify-dm`, `notify-group-couple`, `notify_core.py`, and every
+Installs `notify-dm`, `notify-group-couple`, `notify-group-family`, `notify_core.py`, and every
 `notifiers/*.sh` / `notifiers/*.py` into `~/.openclaw/workspace/scripts/`,
 installs bundled LaunchAgent plist files into `~/Library/LaunchAgents/`, and
 seeds `~/.openclaw/notify/routes.json` from the example if it doesn't exist

@@ -1,0 +1,14 @@
+#!/bin/zsh
+# notify-group-family — send a notification to the LINE 尤家人 group across all
+# channels configured for the "group-family" route.
+#
+# Naming convention: each group has a notify-group-<name> shim backed by a
+# matching route in routes.json.
+#
+# Usage:
+#   notify-group-family "message text"
+#   echo "message text" | notify-group-family
+#   notify-group-family --dry-run "preview only"
+set -euo pipefail
+here="${0:A:h}"
+exec /usr/bin/env python3 "$here/notify_core.py" --route group-family "$@"
