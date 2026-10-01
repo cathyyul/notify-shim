@@ -20,6 +20,12 @@ Design notes
   (default ``~/.openclaw/notify/routes.json``), never in the repo.
 * **Gateway dependency.** Delivery goes through ``openclaw message send``, so the
   OpenClaw gateway must be running.
+* **Machine-readable result (notify-shim#45).** Opt-in ``--result-json
+  --attempt-id <id>`` prints one versioned JSON object after the fan-out, and
+  ``--contract-version`` is a read-only capability probe. ``delivered`` means at
+  least one channel's send API accepted the message — not that it was shown or
+  read — and a crash after a send can still make an upstream caller retry, so
+  delivery is at-least-once. Without the new flags nothing changes.
 
 Stdlib only; runs on the system ``python3`` (3.9) and the workspace venv (3.14).
 """
@@ -528,18 +534,142 @@ def _resolve_message(args) -> str:
     return sys.stdin.read()
 
 
+# --------------------------------------------------------------------------- #
+# Machine-readable result (notify-shim#45)
+#
+# A caller that must record "this alert was sent" cannot use the default exit
+# code: 0 also covers a route whose channels are all disabled (nothing sent),
+# and the send-ledger is best-effort. ``--result-json`` prints one versioned
+# object whose status is derived only from this run's channel results, and the
+# exit code is a pure function of that status — exit 0 if and only if
+# ``delivered``. Channel lists carry names only: targets and command output
+# can hold private chat IDs.
+# --------------------------------------------------------------------------- #
+RESULT_CONTRACT = "notify-shim.result"
+RESULT_CONTRACT_VERSION = 1
+RESULT_EXIT = {"delivered": 0, "failed": 1, "error": 2, "disabled": 3, "dry_run": 4}
+ATTEMPT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+
+
+def _emit_json(obj, exit_code: int) -> int:
+    """Write one JSON line; a result that cannot be written is an error."""
+    try:
+        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except (OSError, ValueError) as exc:
+        print(f"notify: result JSON could not be written ({exc}); "
+              f"treat this attempt as not delivered", file=sys.stderr)
+        return RESULT_EXIT["error"]
+    return exit_code
+
+
+def _emit_result(attempt_id, route: str, status: str, *, delivered=(),
+                 failed=(), reason=None) -> int:
+    return _emit_json({
+        "contract": RESULT_CONTRACT,
+        "version": RESULT_CONTRACT_VERSION,
+        "attempt_id": attempt_id,
+        "route": route,
+        "status": status,
+        "delivered_channels": list(delivered),
+        "failed_channels": list(failed),
+        "reason": reason,
+    }, RESULT_EXIT[status])
+
+
+def _report_channels(route: str, results, *, dry_run: bool, notes) -> None:
+    """Per-channel stderr summary plus the partial-failure alert."""
+    failed = [r for r in results if not r[2]]
+    for channel, target, ok, detail in results:
+        status = "ok" if ok else "FAIL"
+        line = f"[{status}] {channel}:{target}"
+        if not ok and detail:
+            line += f" — {detail}"
+        print(line, file=sys.stderr)
+    if failed:
+        maybe_send_failure_alert(route, results, dry_run=dry_run, notes=notes)
+        print(
+            f"notify: {len(failed)}/{len(results)} channel(s) FAILED "
+            f"for route '{route}'",
+            file=sys.stderr,
+        )
+
+
+def _main_result_json(args) -> int:
+    attempt_id = args.attempt_id
+    if not isinstance(attempt_id, str) or not ATTEMPT_ID_RE.fullmatch(attempt_id):
+        print("notify: --result-json needs --attempt-id matching "
+              f"{ATTEMPT_ID_RE.pattern}", file=sys.stderr)
+        return _emit_result(None, args.route, "error", reason="invalid attempt id")
+    message = _resolve_message(args).strip()
+    if not message:
+        print("notify: empty message", file=sys.stderr)
+        return _emit_result(attempt_id, args.route, "error", reason="empty message")
+    notes: list[str] = []
+    try:
+        results = notify(args.route, message, routes_path=args.routes,
+                         dry_run=args.dry_run, notes=notes)
+    except (FileNotFoundError, KeyError, ValueError) as exc:
+        print(f"notify: {exc}", file=sys.stderr)
+        return _emit_result(attempt_id, args.route, "error",
+                            reason=f"config error: {exc}")
+    except Exception as exc:
+        # A send may already have gone out; the caller still must not count
+        # this attempt as delivered (at-least-once, never false success).
+        print(f"notify: unexpected {type(exc).__name__}: {exc}", file=sys.stderr)
+        return _emit_result(attempt_id, args.route, "error",
+                            reason=f"unexpected {type(exc).__name__}")
+    if not results:
+        print(f"notify: route '{args.route}' has no enabled channels — "
+              f"nothing sent", file=sys.stderr)
+        return _emit_result(attempt_id, args.route, "disabled",
+                            reason="no enabled channels")
+    delivered = [channel for channel, _target, ok, _detail in results if ok]
+    failed = [channel for channel, _target, ok, _detail in results if not ok]
+    try:
+        _report_channels(args.route, results, dry_run=args.dry_run, notes=notes)
+    except Exception as exc:
+        # Reporting is diagnostics; the channel results above already decide.
+        print(f"notify: channel report failed ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+    if args.dry_run:
+        return _emit_result(attempt_id, args.route, "dry_run",
+                            reason="dry run: nothing sent")
+    if delivered:
+        return _emit_result(attempt_id, args.route, "delivered",
+                            delivered=delivered, failed=failed)
+    return _emit_result(attempt_id, args.route, "failed", failed=failed,
+                        reason="every enabled channel failed")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="notify_core",
         description="Fan a message out to every channel of a named route.",
     )
-    ap.add_argument("--route", required=True, help="route name, e.g. dm")
+    ap.add_argument("--route", help="route name, e.g. dm (required unless --contract-version)")
     ap.add_argument("-m", "--message", help="message text (else positional, else stdin)")
     ap.add_argument("words", nargs="*", help="message text as positional words")
     ap.add_argument("--routes", help="explicit routes.json path")
     ap.add_argument("--dry-run", action="store_true",
                     help="print what would be sent; do NOT call openclaw")
+    ap.add_argument("--result-json", action="store_true",
+                    help="print one versioned JSON result on stdout; exit 0 only if delivered")
+    ap.add_argument("--attempt-id", help="caller attempt ID echoed in the --result-json object")
+    ap.add_argument("--contract-version", action="store_true",
+                    help="print the result contract version and exit; sends nothing")
     args = ap.parse_args(argv)
+
+    if args.contract_version:
+        return _emit_json({"contract": RESULT_CONTRACT,
+                           "version": RESULT_CONTRACT_VERSION,
+                           "statuses": sorted(RESULT_EXIT)}, 0)
+    if not args.route:
+        ap.error("the following arguments are required: --route")
+    if args.attempt_id is not None and not args.result_json:
+        ap.error("--attempt-id requires --result-json")
+    if args.result_json:
+        return _main_result_json(args)
 
     message = _resolve_message(args).strip()
     if not message:
@@ -560,29 +690,13 @@ def main(argv=None) -> int:
               f"nothing sent", file=sys.stderr)
         return 0
 
-    failed = [r for r in results if not r[2]]
-    succeeded = [r for r in results if r[2]]
-    for channel, target, ok, detail in results:
-        status = "ok" if ok else "FAIL"
-        line = f"[{status}] {channel}:{target}"
-        if not ok and detail:
-            line += f" — {detail}"
-        print(line, file=sys.stderr)
-
-    if failed:
-        maybe_send_failure_alert(args.route, results, dry_run=args.dry_run,
-                                 notes=notes)
-        print(
-            f"notify: {len(failed)}/{len(results)} channel(s) FAILED "
-            f"for route '{args.route}'",
-            file=sys.stderr,
-        )
-        # Partial failure must NOT fail the whole flow (notify-shim#26): if at
-        # least one channel delivered, the message reached the user, so exit 0
-        # and let the throttled email alert carry the failure. Only a total
-        # outage (no channel delivered) is a non-zero exit.
-        if not succeeded:
-            return 1
+    _report_channels(args.route, results, dry_run=args.dry_run, notes=notes)
+    # Partial failure must NOT fail the whole flow (notify-shim#26): if at
+    # least one channel delivered, the message reached the user, so exit 0
+    # and let the throttled email alert carry the failure. Only a total
+    # outage (no channel delivered) is a non-zero exit.
+    if not any(r[2] for r in results):
+        return 1
     return 0
 
 

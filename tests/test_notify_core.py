@@ -646,3 +646,228 @@ def test_caller_line_keeps_the_head_of_a_long_command(monkeypatch):
     line = notify_core._describe_caller()
     assert "openclaw_channel_watchdog.py" in line
     assert line.rstrip().endswith("…")
+
+
+# --- machine-readable result + contract probe (notify-shim#45) ---
+
+RESULT_ROUTES = {
+    "dm": {"channels": [
+        {"channel": "telegram", "target": "111"},
+        {"channel": "line", "target": "Uabc"},
+    ]},
+    "solo": {"channels": [{"channel": "telegram", "target": "111"}]},
+    "all-off": {"channels": [
+        {"channel": "telegram", "target": "111", "enabled": False},
+    ]},
+    "empty": {"channels": []},
+}
+PRIVATE_TARGETS = ("111", "Uabc")
+
+
+@pytest.fixture
+def result_routes(tmp_path):
+    p = tmp_path / "routes.json"
+    p.write_text(json.dumps(RESULT_ROUTES), encoding="utf-8")
+    return str(p)
+
+
+def _result_main(capsys, args, attempt="att-1"):
+    argv = list(args)
+    if attempt is not None:
+        argv += [f"--attempt-id={attempt}"]
+    rc = notify_core.main(argv + ["--result-json"])
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    assert len(lines) == 1, out  # exactly one JSON object on stdout
+    result = json.loads(lines[0])
+    assert result["contract"] == "notify-shim.result" and result["version"] == 1
+    assert rc == notify_core.RESULT_EXIT[result["status"]]  # exit code agrees
+    for target in PRIVATE_TARGETS:
+        assert target not in out  # no private target ID leaks
+    return rc, result
+
+
+@pytest.mark.parametrize("route,fail,status,delivered,failed", [
+    ("solo", set(), "delivered", ["telegram"], []),
+    ("dm", set(), "delivered", ["telegram", "line"], []),
+    ("dm", {"Uabc"}, "delivered", ["telegram"], ["line"]),
+    ("dm", {"111", "Uabc"}, "failed", [], ["telegram", "line"]),
+])
+def test_result_json_reports_channel_outcomes(monkeypatch, result_routes, capsys,
+                                              route, fail, status, delivered, failed):
+    monkeypatch.setattr(notify_core.subprocess, "run", make_run(fail_targets=fail))
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+    rc, result = _result_main(capsys, ["--route", route, "-m", "hi", "--routes", result_routes])
+    assert result["status"] == status
+    assert result["attempt_id"] == "att-1" and result["route"] == route
+    assert result["delivered_channels"] == delivered
+    assert result["failed_channels"] == failed
+    assert (rc == 0) is (status == "delivered")
+
+
+def test_result_json_partial_failure_still_alerts(monkeypatch, result_routes, capsys,
+                                                  alert_config):
+    monkeypatch.setattr(notify_core.subprocess, "run", make_run(fail_targets={"Uabc"}))
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+    rc, result = _result_main(capsys, ["--route", "dm", "-m", "hi", "--routes", result_routes])
+    assert (rc, result["status"]) == (0, "delivered")
+    assert len(alert_config) == 1  # existing throttled email path unchanged
+
+
+def test_result_json_all_disabled_is_nonzero(monkeypatch, result_routes, capsys):
+    monkeypatch.setattr(notify_core.subprocess, "run",
+                        lambda *a, **k: pytest.fail("must not send"))
+    rc, result = _result_main(capsys, ["--route", "all-off", "-m", "hi", "--routes", result_routes])
+    assert result["status"] == "disabled" and rc != 0
+    assert result["delivered_channels"] == [] and result["failed_channels"] == []
+
+
+def test_default_mode_all_disabled_still_exits_zero(monkeypatch, result_routes, capsys):
+    monkeypatch.setattr(notify_core.subprocess, "run",
+                        lambda *a, **k: pytest.fail("must not send"))
+    assert notify_core.main(["--route", "all-off", "-m", "hi", "--routes", result_routes]) == 0
+    assert capsys.readouterr().out == ""  # default mode prints nothing on stdout
+
+
+def test_result_json_dry_run_never_reports_delivered(monkeypatch, result_routes, capsys):
+    monkeypatch.setattr(notify_core.subprocess, "run",
+                        lambda *a, **k: pytest.fail("dry-run must not send"))
+    rc, result = _result_main(capsys, ["--route", "dm", "-m", "hi", "--routes",
+                                       result_routes, "--dry-run"])
+    assert result["status"] == "dry_run" and rc != 0
+    assert result["delivered_channels"] == []
+    assert not Path(notify_core.ledger_path()).exists()
+
+
+def test_result_json_survives_ledger_write_failure(monkeypatch, result_routes, capsys,
+                                                   tmp_path):
+    monkeypatch.setattr(notify_core.subprocess, "run", make_run())
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setenv("NOTIFY_LEDGER", str(blocker / "ledger.jsonl"))
+    rc, result = _result_main(capsys, ["--route", "solo", "-m", "hi", "--routes", result_routes])
+    assert (rc, result["status"]) == (0, "delivered")  # result does not depend on the ledger
+
+
+def test_result_json_timeout_is_a_failed_channel(monkeypatch, result_routes, capsys):
+    def run(cmd, **kwargs):
+        raise notify_core.subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+    rc, result = _result_main(capsys, ["--route", "solo", "-m", "hi", "--routes", result_routes])
+    assert (rc, result["status"], result["failed_channels"]) == (1, "failed", ["telegram"])
+
+
+@pytest.mark.parametrize("args,needle", [
+    (["--route", "nope", "-m", "hi"], "unknown route"),
+    (["--route", "empty", "-m", "hi"], "no channels"),
+    (["--route", "dm", "-m", "   "], "empty message"),
+])
+def test_result_json_config_errors_are_error_status(monkeypatch, result_routes, capsys,
+                                                    args, needle):
+    monkeypatch.setattr(notify_core.subprocess, "run",
+                        lambda *a, **k: pytest.fail("must not send"))
+    rc, result = _result_main(capsys, args + ["--routes", result_routes])
+    assert (rc, result["status"]) == (2, "error")
+    assert needle in result["reason"]
+
+
+def test_result_json_missing_routes_file_is_error(monkeypatch, tmp_path, capsys):
+    monkeypatch.setenv("NOTIFY_ROUTES", str(tmp_path / "missing.json"))
+    monkeypatch.setattr(notify_core, "default_routes_paths", lambda: [str(tmp_path / "missing.json")])
+    rc, result = _result_main(capsys, ["--route", "dm", "-m", "hi"])
+    assert (rc, result["status"]) == (2, "error")
+
+
+def test_result_json_unexpected_exception_is_error(monkeypatch, result_routes, capsys):
+    def explode(*a, **k):
+        raise RuntimeError("boom 111")  # message may carry private data
+    monkeypatch.setattr(notify_core, "notify", explode)
+    rc, result = _result_main(capsys, ["--route", "dm", "-m", "hi", "--routes", result_routes])
+    assert (rc, result["status"]) == (2, "error")
+    assert result["reason"] == "unexpected RuntimeError"
+
+
+@pytest.mark.parametrize("attempt", [None, "", "has space", "x" * 129, "-leading"])
+def test_result_json_requires_a_valid_attempt_id(monkeypatch, result_routes, capsys, attempt):
+    monkeypatch.setattr(notify_core.subprocess, "run",
+                        lambda *a, **k: pytest.fail("must not send"))
+    rc, result = _result_main(capsys, ["--route", "dm", "-m", "hi", "--routes", result_routes],
+                              attempt=attempt)
+    assert (rc, result["status"], result["attempt_id"]) == (2, "error", None)
+
+
+def test_attempt_id_without_result_json_is_a_usage_error(result_routes, capsys):
+    with pytest.raises(SystemExit) as exc:
+        notify_core.main(["--route", "dm", "-m", "hi", "--routes", result_routes,
+                          "--attempt-id", "att-1"])
+    assert exc.value.code == 2
+    capsys.readouterr()
+
+
+def test_unwritable_result_is_never_delivered(monkeypatch, result_routes, capsys):
+    monkeypatch.setattr(notify_core.subprocess, "run", make_run())
+    monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
+
+    class BrokenStdout:
+        def write(self, _text):
+            raise BrokenPipeError("closed")
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(notify_core.sys, "stdout", BrokenStdout())
+    rc = notify_core.main(["--route", "solo", "-m", "hi", "--routes", result_routes,
+                           "--result-json", "--attempt-id", "att-1"])
+    assert rc == notify_core.RESULT_EXIT["error"]
+    assert "not delivered" in capsys.readouterr().err
+
+
+def test_contract_version_is_read_only(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(notify_core.subprocess, "run",
+                        lambda *a, **k: pytest.fail("probe must not send"))
+    monkeypatch.setattr(notify_core, "load_routes",
+                        lambda *a, **k: pytest.fail("probe must not read routes"))
+    assert notify_core.main(["--contract-version"]) == 0
+    assert notify_core.main(["--route", "dm", "--contract-version", "ignored text"]) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert len(lines) == 2
+    for line in lines:
+        probe = json.loads(line)
+        assert probe["contract"] == "notify-shim.result" and probe["version"] == 1
+        assert set(probe["statuses"]) == set(notify_core.RESULT_EXIT)
+    assert not Path(notify_core.ledger_path()).exists()
+
+
+def test_route_still_required_without_probe(capsys):
+    with pytest.raises(SystemExit) as exc:
+        notify_core.main(["-m", "hi"])
+    assert exc.value.code == 2
+    assert "the following arguments are required: --route" in capsys.readouterr().err
+
+
+SHIM = Path(__file__).resolve().parent.parent / "notify-dm"
+
+
+def test_shim_probe_end_to_end(tmp_path):
+    env = dict(os.environ, NOTIFY_LEDGER=str(tmp_path / "ledger.jsonl"),
+               NOTIFY_ROUTES=str(tmp_path / "missing.json"))
+    proc = __import__("subprocess").run([str(SHIM), "--contract-version"], capture_output=True,
+                                        text=True, env=env, timeout=30)
+    assert proc.returncode == 0
+    assert json.loads(proc.stdout)["version"] == 1
+    assert not (tmp_path / "ledger.jsonl").exists()
+
+
+def test_shim_without_capability_fails_closed(tmp_path):
+    # A pre-#45 shim rejects --contract-version/--result-json exactly the way
+    # the current parser rejects any flag it does not know: argparse exits 2
+    # before sending, with nothing on stdout. A caller must treat a non-zero
+    # or non-JSON probe as "capability missing" and stop.
+    env = dict(os.environ, NOTIFY_LEDGER=str(tmp_path / "ledger.jsonl"),
+               NOTIFY_ROUTES=str(tmp_path / "missing.json"))
+    proc = __import__("subprocess").run([str(SHIM), "--contract-version-v2"], capture_output=True,
+                                        text=True, env=env, timeout=30)
+    assert proc.returncode == 2 and proc.stdout == ""
+    assert not (tmp_path / "ledger.jsonl").exists()
