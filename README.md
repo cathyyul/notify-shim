@@ -47,6 +47,51 @@ Only a **total** outage (every channel failed) exits non-zero.
 > its DM had already reached Yuting via Telegram (wsi#121). The failure is now
 > carried by the email alert instead of by the exit code.
 
+## Machine-readable result (`--result-json`, `--contract-version`)
+
+The default exit code cannot prove a message went out: exit 0 also covers a
+route whose channels are all disabled, and the send-ledger is best-effort. A
+caller that records "alert sent" (affiliate-wp-writer#620) opts in instead
+(notify-shim#45). Without these flags the CLI behaves exactly as above.
+
+```sh
+notify-dm --contract-version
+# {"contract": "notify-shim.result", "version": 1, "statuses": [...]}
+
+notify-dm --result-json --attempt-id thu-2026-10-02-r1 "message"
+# {"contract": "notify-shim.result", "version": 1, "attempt_id": "thu-2026-10-02-r1",
+#  "route": "dm", "status": "delivered", "delivered_channels": ["telegram", "line"],
+#  "failed_channels": [], "reason": null}
+```
+
+- **Probe first.** `--contract-version` reads no config, sends nothing and
+  writes no ledger. A shim older than v1 rejects the flag as an unknown option
+  (exit 2, empty stdout); a caller must treat any non-zero exit, non-JSON
+  output or `version` < 1 as "capability missing" and stop before sending.
+- **One object.** `--result-json` prints exactly one JSON line on stdout after
+  the fan-out (stderr keeps the per-channel summary). `--attempt-id` is
+  required (`[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`) and echoed back; it is not
+  accepted without `--result-json`.
+- **Status and exit code always agree; exit 0 only for `delivered`:**
+
+  | `status` | meaning | exit |
+  |---|---|---|
+  | `delivered` | at least one enabled channel's send API accepted (`failed_channels` may be non-empty; the partial-failure email still goes out) | 0 |
+  | `failed` | every enabled channel failed (incl. per-channel timeout) | 1 |
+  | `error` | bad attempt ID, empty message, missing/invalid routes, unknown route, unexpected exception, or the result could not be written | 2 |
+  | `disabled` | the route has no enabled channel; nothing sent | 3 |
+  | `dry_run` | `--dry-run`; nothing sent, never reported as delivered | 4 |
+
+- **No private IDs.** Channel lists carry channel names only; targets and
+  command output stay out of the JSON.
+- **Ledger-independent.** The status comes from this run's channel results;
+  a failed send-ledger append does not change it.
+- **What `delivered` does not mean.** It is route-level API acceptance, not
+  proof the message was displayed or read. If the shim crashes or its output
+  is lost after a send, the caller sees no result and may retry, so delivery
+  is at-least-once and duplicates are possible. A durable attempt-ID receipt
+  store would narrow that window; it does not exist yet.
+
 ## Failure-alert email (`failure-alert.json`)
 
 When a channel fails, the shim can email a summary so the failure is not lost.
