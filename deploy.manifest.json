@@ -32,15 +32,6 @@
       "note": "每小時掃 ~/Library/Logs/Claude/main.log：session_stale_relogin／spawn 逾時未 Confirmed → notify-dm 告警（帶原因＋修法＋受影響 task 清單，12h cooldown、新 task 可再發）；恢復後發恢復通知（notify-shim#22，2026-08-18 靜默失敗 20h 事故的 watchdog）。"
     },
     {
-      "src": "launchagents/com.openclaw.couple-review-nudge.plist",
-      "dest": "~/Library/LaunchAgents/com.openclaw.couple-review-nudge.plist",
-      "mode": "template",
-      "vars": ["WS"],
-      "chmod": "0644",
-      "launchctl": "bootstrap",
-      "note": "每日 21:00：若當日有 group-couple 送出，寄 nudge email 給 Chi（couple_review_email_nudge.py，讀 notify_core send-ledger）。"
-    },
-    {
       "src": "routes.example.json",
       "dest": "~/.openclaw/notify/routes.json",
       "mode": "seed",
@@ -48,20 +39,23 @@
       "note": "真實 routes.json（含 chat/user/group id）住 repo 外，永不覆蓋既有"
     },
     {
-      "src": "review-email.example.json",
-      "dest": "~/.openclaw/notify/review-email.json",
-      "mode": "seed",
-      "chmod": "0600",
-      "note": "真實收件人（Chi email）+ 寄件帳號住 repo 外，永不覆蓋既有"
-    },
-    {
       "src": "failure-alert.example.json",
       "dest": "~/.openclaw/notify/failure-alert.json",
       "mode": "seed",
       "chmod": "0600",
-      "note": "notify-shim#26 部分 channel 失敗時的 email 告警設定（真實收件/寄件帳號住 repo 外的本地 ~/.openclaw/notify/failure-alert.json，同 review-email.json 慣例；repo 只放 placeholder，seed 永不覆蓋既有）"
+      "note": "notify-shim#26 部分 channel 失敗時的 email 告警設定（真實收件/寄件帳號住 repo 外的本地 ~/.openclaw/notify/failure-alert.json，同 routes.json 慣例；repo 只放 placeholder，seed 永不覆蓋既有）"
     }
   ],
-  "removals": [],
+  "removals": [
+    {
+      "path": "~/Library/LaunchAgents/com.openclaw.couple-review-nudge.plist",
+      "launchctl": true,
+      "note": "notify-shim#47：Chi 改看 LINE 群組，group-couple 收斂為 LINE-only，每日 21:00 的 Chi review-email nudge 退役——deploy 先 bootout 再刪 plist"
+    },
+    {
+      "path": "scripts/couple_review_email_nudge.py",
+      "note": "notify-shim#47：nudge 腳本隨 LaunchAgent 退役（notifiers/*.py glob 不再含它，顯式刪除避免殘留 UNOWNED）"
+    }
+  ],
   "hooks": { "pre": "hooks/pre_deploy.sh", "post": null }
 }

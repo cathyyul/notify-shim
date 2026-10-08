@@ -1,7 +1,7 @@
 #!/bin/zsh
 # weekly_offers_deliver.sh — run the weekly CardPointers standard-offers review
-# and notify via the shims. Goes to Yuting's DM (notify-dm) AND the couple group
-# (notify-group-couple), each fanning out to Telegram + LINE.
+# and notify via the shims. Goes to Yuting's DM (notify-dm, Telegram + LINE) AND
+# the couple group (notify-group-couple, LINE-only since notify-shim#47).
 # Run weekly by com.openclaw.weekly-standard-offers.
 set -euo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"

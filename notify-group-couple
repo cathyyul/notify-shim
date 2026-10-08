@@ -1,7 +1,7 @@
 #!/bin/zsh
 # notify-group-couple — send a notification to the couple group across all
 # channels configured for the "group-couple" route
-# (currently Telegram 小寶murmur + LINE 海老群).
+# (currently LINE 海老群 only — Telegram 小寶murmur retired in notify-shim#47).
 #
 # Naming convention: future groups get their own shim, notify-group-<name>,
 # backed by a matching route in routes.json.
