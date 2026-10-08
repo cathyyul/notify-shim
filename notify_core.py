@@ -70,7 +70,7 @@ def ledger_path() -> str:
 # fails, exit stays non-zero (a genuine notification outage) — and the email
 # (an independent transport) is the escalation path.
 #
-# The email goes through gog (same mechanism as couple_review_email_nudge.py);
+# The email goes through gog;
 # recipient/sender come from config, not hardcoded. Throttled to at most one
 # email per channel per day so a channel that keeps failing does not spam.
 # --------------------------------------------------------------------------- #
@@ -344,8 +344,9 @@ def maybe_send_failure_alert(route: str, results, *, dry_run: bool,
 def _record_ledger(route: str, results, *, dry_run: bool, notes=None) -> None:
     """Best-effort append of one send record; never raises.
 
-    A downstream digest (e.g. the couple-group evening email nudge) reads this
-    to learn whether anything was posted to a route today. A ledger write must
+    A downstream consumer can read this to learn whether anything was posted
+    to a route today (the couple-group evening email nudge did, until it was
+    retired in notify-shim#47). A ledger write must
     never affect notification delivery, so every error here is swallowed.
     """
     if dry_run:
@@ -353,10 +354,10 @@ def _record_ledger(route: str, results, *, dry_run: bool, notes=None) -> None:
     try:
         channels = {ch: ok for (ch, _tgt, ok, _detail) in results}
         entry = {
-            # Microsecond precision: the couple-group nudge watermark filters
-            # with a strict ``ts > since``, so two sends in the same whole
-            # second must still get distinct, ordered timestamps or the later
-            # one would compare equal to the watermark and be skipped forever.
+            # Microsecond precision: a consumer filtering with a strict
+            # ``ts > since`` watermark needs two sends in the same whole
+            # second to get distinct, ordered timestamps, or the later one
+            # would compare equal to the watermark and be skipped forever.
             "ts": dt.datetime.now().astimezone().isoformat(timespec="microseconds"),
             "route": route,
             "ok": any(channels.values()),
@@ -370,8 +371,8 @@ def _record_ledger(route: str, results, *, dry_run: bool, notes=None) -> None:
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except Exception as exc:
-        # Never break delivery — but don't fail silently either: the couple-group
-        # nudge relies on this ledger as its only source of truth, so a lost
+        # Never break delivery — but don't fail silently either: a consumer
+        # may rely on this ledger as its only source of truth, so a lost
         # append must at least be visible in logs.
         message = (f"send-ledger append failed ({exc}); "
                    f"'{route}' event not recorded")

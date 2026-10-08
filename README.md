@@ -17,7 +17,7 @@ change.
 | Shim | Route | Channels (current) |
 |------|-------|--------------------|
 | `notify-dm` | `dm` | Telegram DM + LINE DM |
-| `notify-group-couple` | `group-couple` | Telegram `小寶murmur` + LINE `海老群` |
+| `notify-group-couple` | `group-couple` | LINE `海老群` (Telegram `小寶murmur` retired in #47) |
 | `notify-group-family` | `group-family` | LINE `尤家人` |
 
 Naming convention: a future group gets its own shim `notify-group-<name>` backed
@@ -107,13 +107,13 @@ repo ships [`failure-alert.example.json`](failure-alert.example.json):
 }
 ```
 
-Like `routes.json` and `review-email.json`, the **real** recipient/sender are
+Like `routes.json`, the **real** recipient/sender are
 **not** in this repo — they live only in the local, out-of-repo
 `~/.openclaw/notify/failure-alert.json` (0600). The repo ships placeholders; the
 seed deploy never overwrites an existing local file, so fill it in once with a
 real recipient and a `gog`-authenticated sender.
 
-The email goes out through `gog` (same mechanism as the couple review nudge).
+The email goes out through `gog`.
 Alerting is **off until `from_account` is a real gog-authenticated sender** (a
 placeholder, blank field, missing file, or `"enabled": false` disables it — the
 shim just logs "not configured" and skips; delivery and exit code are
@@ -154,9 +154,8 @@ gitignored file (default `~/.openclaw/notify/routes.json`). The repo ships
     ]
   },
   "group-couple": {
-    "description": "Couple group — Telegram 小寶murmur / LINE 海老群",
+    "description": "Couple group — LINE 海老群",
     "channels": [
-      { "channel": "telegram", "target": "<telegram group id>" },
       { "channel": "line", "target": "<line group id>" }
     ]
   },
