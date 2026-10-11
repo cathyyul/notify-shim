@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -395,16 +396,29 @@ def cooldown_elapsed(state: dict[str, Any], key: str, cooldown_minutes: int) -> 
     return (now_utc() - ts).total_seconds() >= cooldown_minutes * 60
 
 
-def format_alert(results: list[CheckResult], recovery_mode: str) -> str:
+def format_alert(results: list[CheckResult], recovery_mode: str,
+                 incident: dict[str, Any] | None = None) -> str:
     lines = ["OpenClaw channel watchdog detected unhealthy channel(s):"]
+    attempted = (incident or {}).get("restart_attempted_at")
+    if attempted:
+        elapsed = (incident or {}).get("post_restart_elapsed_seconds")
+        if (incident or {}).get("restart_succeeded") is False:
+            lines.insert(0, f"已於 {attempted} 嘗試自動重啟 gateway，但重啟指令失敗。")
+        elif elapsed is not None:
+            lines.insert(0, f"已於 {attempted} 自動重啟 gateway，等 {elapsed:g} 秒仍未恢復；本事件已自動重啟過。")
+        else:
+            lines.insert(0, f"本事件已自動重啟過 gateway（{attempted}）；目前仍未恢復。")
     for result in results:
         if result.ok:
             continue
         lines.append(f"- {result.channel}: {result.status}")
         lines.append(f"  {result.detail}")
-        if result.suggested_next_step:
+        if attempted and result.status != WHATSAPP_LOGGED_OUT_STATUS:
+            lines.append("  Next: 執行 openclaw channels status --probe；檢查 gateway log "
+                         "/tmp/openclaw/openclaw-YYYY-MM-DD.log。")
+        elif result.suggested_next_step:
             lines.append(f"  Next: {result.suggested_next_step}")
-    if recovery_mode == "restart":
+    if recovery_mode == "restart" and not attempted:
         lines.append("Recovery mode: restart once for this active incident, then notify-only.")
     else:
         lines.append("Recovery mode: notify-only.")
@@ -489,21 +503,29 @@ def maybe_notify(unhealthy: list[CheckResult], recovery_mode: str, notify_bin: P
                  incident: dict[str, Any], cooldown_minutes: int) -> bool:
     if not cooldown_elapsed(incident, "last_alert_at", cooldown_minutes):
         return False
-    send_notification(format_alert(unhealthy, recovery_mode), notify_bin)
+    send_notification(format_alert(unhealthy, recovery_mode, incident), notify_bin)
     incident["last_alert_at"] = iso_now()
     return True
 
 
 def evaluate_channels(channels: list[str], config: dict[str, Any],
                       gateway_port: int, timeout_ms: int,
-                      openclaw_bin: str) -> list[CheckResult]:
+                      openclaw_bin: str, deadline: float | None = None) -> list[CheckResult]:
     requested = ["line", "whatsapp"] if "all" in channels else channels
     results: list[CheckResult] = []
     for channel in requested:
+        remaining = float("inf") if deadline is None else deadline - time.monotonic()
+        if remaining <= 0 or (channel == "whatsapp" and remaining <= 5):
+            results.append(CheckResult(channel, False, "check_budget_exhausted",
+                                       "Watchdog health-check time budget exhausted"))
+            continue
         if channel == "line":
-            results.append(check_line(config, gateway_port, timeout_ms / 1000))
+            # LINE makes two sequential HTTP calls; reserve time for both.
+            results.append(check_line(config, gateway_port, min(timeout_ms / 1000, remaining / 2)))
         elif channel == "whatsapp":
-            results.append(check_whatsapp(timeout_ms, openclaw_bin))
+            # check_whatsapp's CLI wrapper adds five seconds to the probe timeout.
+            probe_ms = timeout_ms if deadline is None else min(timeout_ms, max(1, int((remaining - 5) * 1000)))
+            results.append(check_whatsapp(probe_ms, openclaw_bin))
         else:
             results.append(CheckResult(channel, False, "unsupported_channel",
                                        f"Unsupported channel: {channel}"))
@@ -524,8 +546,11 @@ def main() -> int:
                         help="notify=alert only; restart=restart gateway once per active incident")
     parser.add_argument("--cooldown-minutes", type=int, default=30,
                         help="Minimum minutes between alerts")
-    parser.add_argument("--post-restart-delay-sec", type=float, default=5.0,
-                        help="Seconds to wait before re-checking after gateway restart")
+    parser.add_argument("--post-restart-poll-sec", "--post-restart-delay-sec",
+                        dest="post_restart_poll_sec", type=float, default=10.0,
+                        help="Seconds between post-restart health polls (default: 10; old delay flag is an alias)")
+    parser.add_argument("--post-restart-timeout-sec", type=float, default=120.0,
+                        help="Maximum post-restart polling window (default: 120), limited by the 300s tick budget")
     parser.add_argument("--gateway-port", type=int,
                         default=int(os.environ.get("OPENCLAW_GATEWAY_PORT", "18789")))
     parser.add_argument("--timeout-ms", type=int, default=10000)
@@ -538,13 +563,24 @@ def main() -> int:
                         help="Path to openclaw CLI; use an absolute path for LaunchAgent runs")
     parser.add_argument("--json", action="store_true", help="Print machine-readable result")
     args = parser.parse_args()
+    if (not math.isfinite(args.post_restart_poll_sec) or args.post_restart_poll_sec <= 0
+            or not math.isfinite(args.post_restart_timeout_sec) or args.post_restart_timeout_sec <= 0
+            or args.timeout_ms <= 0):
+        parser.error("poll, polling timeout and check timeout must be finite positive values")
 
     try:
+        started = time.monotonic()
+        # Reserve the shim's full route budget, rather than killing an alert mid-send
+        # (#35). Slow checks/restart shorten the polling window. Keep 5s for I/O.
+        notification_budget = notify_timeout_seconds() if args.notify else 0
+        if notification_budget >= 295:
+            raise ValueError("notify route budget leaves no health-check time within the 300s watchdog tick")
+        health_deadline = started + 295 - notification_budget
         state = load_json(args.state_file)
         config = load_json(args.config_file)
         results = evaluate_channels(
             args.channels, config, args.gateway_port, args.timeout_ms,
-            args.openclaw_bin,
+            args.openclaw_bin, deadline=health_deadline,
         )
         unhealthy = [result for result in results if not result.ok]
 
@@ -574,16 +610,41 @@ def main() -> int:
                     )
             elif args.recovery_mode == "restart":
                 if not incident.get("restart_attempted_at"):
-                    recovery_result = restart_gateway(args.openclaw_bin)
                     incident["restart_attempted_at"] = iso_now()
-                    if recovery_result.ok and args.post_restart_delay_sec > 0:
-                        time.sleep(args.post_restart_delay_sec)
-                    results = evaluate_channels(
-                        args.channels, config, args.gateway_port, args.timeout_ms,
-                        args.openclaw_bin,
-                    )
+                    remaining = health_deadline - time.monotonic()
+                    if remaining > 0:
+                        recovery_result = restart_gateway(args.openclaw_bin, timeout=min(60, remaining))
+                    else:
+                        recovery_result = CheckResult("gateway", False, "gateway_restart_error",
+                                                      "No remaining time budget for gateway restart")
+                    incident["restart_succeeded"] = recovery_result.ok
+                    poll_started = time.monotonic()
+                    if recovery_result.ok:
+                        poll_deadline = min(poll_started + args.post_restart_timeout_sec, health_deadline)
+                        while time.monotonic() < poll_deadline:
+                            time.sleep(min(args.post_restart_poll_sec, poll_deadline - time.monotonic()))
+                            if time.monotonic() >= poll_deadline:
+                                break
+                            results = evaluate_channels(
+                                args.channels, config, args.gateway_port, args.timeout_ms,
+                                args.openclaw_bin, deadline=poll_deadline,
+                            )
+                            if all(result.ok for result in results):
+                                break
+                        incident["post_restart_elapsed_seconds"] = round(time.monotonic() - poll_started, 3)
+                    else:
+                        results = evaluate_channels(
+                            args.channels, config, args.gateway_port, args.timeout_ms,
+                            args.openclaw_bin, deadline=health_deadline,
+                        )
                     unhealthy = [result for result in results if not result.ok]
                     incident["post_restart_results"] = [asdict(result) for result in results]
+                    if not unhealthy and recovery_result.ok:
+                        state["auto_recovered"] = {
+                            "restart_at": incident["restart_attempted_at"],
+                            "recovered_at": iso_now(),
+                            "elapsed_seconds": incident["post_restart_elapsed_seconds"],
+                        }
                     if unhealthy and args.notify:
                         notified = maybe_notify(
                             unhealthy, args.recovery_mode, args.notify_bin,
@@ -615,6 +676,8 @@ def main() -> int:
             payload["recovery"] = asdict(recovery_result)
         else:
             state.pop("recovery", None)
+        if "auto_recovered" in state:
+            payload["auto_recovered"] = state["auto_recovered"]
         if unhealthy and incident:
             state["active_incident"] = incident
         else:

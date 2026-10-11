@@ -293,7 +293,7 @@ def test_restart_mode_rechecks_and_clears_incident_when_recovered(monkeypatch, t
             return [mod.CheckResult("whatsapp", False, "bad", "broken", "restart")]
         return [mod.CheckResult("whatsapp", True, "healthy", "ok")]
 
-    def fake_restart(openclaw_bin):
+    def fake_restart(openclaw_bin, **kwargs):
         calls["restart"] += 1
         assert openclaw_bin == "openclaw"
         return mod.CheckResult("gateway", True, "gateway_restart_ok", "restarted")
@@ -576,13 +576,15 @@ def test_restart_still_happens_when_another_channel_is_also_broken(monkeypatch, 
             mod.CheckResult("line", False, "line_official_webhook_failed", "broken", "restart"),
         ]
 
-    def fake_restart(openclaw_bin):
+    def fake_restart(openclaw_bin, **kwargs):
         calls["restart"] += 1
         return mod.CheckResult("gateway", True, "gateway_restart_ok", "restarted")
 
     monkeypatch.setattr(mod, "evaluate_channels", fake_evaluate)
     monkeypatch.setattr(mod, "restart_gateway", fake_restart)
-    monkeypatch.setattr(mod.time, "sleep", lambda seconds: None)
+    clock = [0.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(mod.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
     monkeypatch.setattr(mod, "send_notification", lambda *a, **k: None)
     monkeypatch.setattr(sys, "argv", _watchdog_argv(tmp_path, state_file, config_file, notify_bin))
 
@@ -590,6 +592,108 @@ def test_restart_still_happens_when_another_channel_is_also_broken(monkeypatch, 
     assert calls["restart"] == 1, "LINE 也壞掉時，重啟對它仍可能有用，不該一起取消"
     saved = json.loads(state_file.read_text())
     assert saved["recovery"]["status"] == "gateway_restart_ok"
+
+
+@pytest.mark.parametrize("recover", [True, False])
+def test_restart_polls_until_recovered_or_deadline(monkeypatch, tmp_path, recover):
+    clock = [0.0]
+    calls = []
+    messages = []
+    state_file = tmp_path / "state.json"
+    argv = _watchdog_argv(tmp_path, state_file, tmp_path / "config.json", tmp_path / "notify")
+    argv += ["--post-restart-poll-sec", "10", "--post-restart-timeout-sec", "30"]
+    monkeypatch.setattr(sys, "argv", argv)
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(mod.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(mod, "notify_timeout_seconds", lambda: 70)
+
+    def evaluate(*args, **kwargs):
+        calls.append(clock[0])
+        healthy = recover and len(calls) == 3
+        return [mod.CheckResult("line", healthy, "healthy" if healthy else "starting",
+                                "booting", "Restart OpenClaw gateway")]
+
+    monkeypatch.setattr(mod, "evaluate_channels", evaluate)
+    monkeypatch.setattr(mod, "restart_gateway", lambda *a, **k:
+                        mod.CheckResult("gateway", True, "gateway_restart_ok", "restarted"))
+    monkeypatch.setattr(mod, "send_notification", lambda message, notify_bin: messages.append(message))
+    assert mod.main() == (0 if recover else 1)
+    saved = json.loads(state_file.read_text())
+    assert calls == [0, 10, 20]
+    if recover:
+        assert not messages
+        assert "active_incident" not in saved
+        assert saved["auto_recovered"]["elapsed_seconds"] == 20
+        assert saved["auto_recovered"]["restart_at"]
+    else:
+        assert len(messages) == 1
+        assert "自動重啟 gateway" in messages[0]
+        assert "30" in messages[0]
+        assert "Next: Restart" not in messages[0]
+        assert "openclaw channels status --probe" in messages[0]
+        assert saved["active_incident"]["post_restart_elapsed_seconds"] == 30
+
+
+def test_restart_failure_keeps_alerting_without_poll_sleep(monkeypatch, tmp_path):
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(sys, "argv", _watchdog_argv(
+        tmp_path, state_file, tmp_path / "config.json", tmp_path / "notify"))
+    monkeypatch.setattr(mod, "evaluate_channels", lambda *a, **k: [
+        mod.CheckResult("line", False, "bad", "broken", "restart")])
+    monkeypatch.setattr(mod, "restart_gateway", lambda *a, **k:
+                        mod.CheckResult("gateway", False, "gateway_restart_failed", "failed"))
+    monkeypatch.setattr(mod.time, "sleep", lambda *a: pytest.fail("failed restart must not poll"))
+    messages = []
+    monkeypatch.setattr(mod, "send_notification", lambda message, notify_bin: messages.append(message))
+    assert mod.main() == 1
+    assert "重啟指令失敗" in messages[0]
+    assert json.loads(state_file.read_text())["recovery"]["status"] == "gateway_restart_failed"
+
+
+def test_health_checks_share_tick_budget_and_reserve_notification(monkeypatch, tmp_path):
+    clock = [0.0]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(mod.time, "sleep", lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(mod, "notify_timeout_seconds", lambda: 190)
+    monkeypatch.setattr(mod, "load_json", lambda path: {})
+    monkeypatch.setattr(mod, "save_json", lambda *a: None)
+    argv = _watchdog_argv(tmp_path, tmp_path / "state", tmp_path / "config", tmp_path / "notify")
+    argv += ["--timeout-ms", "999999"]
+    monkeypatch.setattr(sys, "argv", argv)
+    def line(config, gateway_port, timeout):
+        clock[0] += 2 * timeout
+        return mod.CheckResult("line", False, "bad", "slow")
+    def whatsapp(timeout_ms, openclaw_bin):
+        clock[0] += timeout_ms / 1000 + 5
+        return mod.CheckResult("whatsapp", False, "bad", "slow")
+    monkeypatch.setattr(mod, "check_line", line)
+    monkeypatch.setattr(mod, "check_whatsapp", whatsapp)
+    def restart(*a, timeout=60):
+        clock[0] += timeout
+        return mod.CheckResult("gateway", True, "gateway_restart_ok", "ok")
+    monkeypatch.setattr(mod, "restart_gateway", restart)
+    monkeypatch.setattr(mod, "send_notification", lambda *a: clock.__setitem__(0, clock[0] + 190))
+    assert mod.main() == 1
+    assert clock[0] <= 295
+
+
+def test_cooldown_reminder_records_previous_restart_without_recommending_it(monkeypatch, tmp_path):
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"active_incident": {
+        "key": "whatsapp", "restart_attempted_at": "2026-10-10T05:33:50+00:00",
+        "restart_succeeded": True, "last_alert_at": None,
+    }}))
+    monkeypatch.setattr(sys, "argv", _watchdog_argv(
+        tmp_path, state_file, tmp_path / "config.json", tmp_path / "notify"))
+    monkeypatch.setattr(mod, "evaluate_channels", lambda *a, **k: [
+        mod.CheckResult("whatsapp", False, "starting", "booting", "Restart OpenClaw gateway")])
+    monkeypatch.setattr(mod, "restart_gateway", lambda *a, **k: pytest.fail("already restarted"))
+    messages = []
+    monkeypatch.setattr(mod, "send_notification", lambda message, notify_bin: messages.append(message))
+    assert mod.main() == 1
+    assert "本事件已自動重啟過" in messages[0]
+    assert "2026-10-10T05:33:50" in messages[0]
+    assert "Next: Restart" not in messages[0]
 
 
 def test_logged_out_alert_says_notify_only_not_restart(monkeypatch, tmp_path):

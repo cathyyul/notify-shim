@@ -333,6 +333,17 @@ restarting and only alert through `notify-dm`, guarded by `--cooldown-minutes`
 (default 30). State is written to
 `~/.openclaw/workspace/data/health/openclaw-channel-watchdog.json`.
 
+After a successful restart, health is polled every `--post-restart-poll-sec`
+(default 10 seconds) for up to `--post-restart-timeout-sec` (default 120 seconds).
+The old `--post-restart-delay-sec` flag is an alias for the polling interval.
+The watchdog reserves the full notification route budget and bounds checks and
+restart calls to keep the tick under the 300-second LaunchAgent interval;
+slow operations can shorten the polling window. Recovery clears the active
+incident without an unhealthy alert and retains `auto_recovered` (restart time,
+recovery time, and elapsed seconds) in state and JSON logs. Timeout alerts and
+later cooldown reminders say the gateway was already restarted and recommend
+status/log inspection. WhatsApp logout still requires relinking, not restarting.
+
 Incident reset behavior:
 - The active incident is keyed by failing channel set, e.g. `line`,
   `whatsapp`, or `line|whatsapp`.
