@@ -38,6 +38,7 @@ MARKER_SPAWN = "[CCDScheduledTasks] Spawning new session for scheduled task "
 MARKER_CONFIRM = "[CCDScheduledTasks] Confirmed task run for: "
 MARKER_CLEARED = "[CCDScheduledTasks] Cleared stale pending dispatch for: "
 MARKER_STALE = "session_stale_relogin"
+MARKER_STALE_CLEARING = "clearing latched session_stale_relogin"
 # A scheduled-task session's start-timing line names the session id; the next
 # CycleHealth api_error line for that id (with a usage/session-limit phrase) is
 # the quota signal. We bind session id -> task via these two so a usage-limit
@@ -194,7 +195,9 @@ def parse_events(lines: "list[str]",
             task = line.split(MARKER_CLEARED, 1)[1].strip()
             if task:
                 events.append(LogEvent("cleared", last_ts, task))
-        elif MARKER_STALE in line:
+        # Clearing a latched error is housekeeping, not a new login failure.
+        # Keep all other stale markers, including multiline error details.
+        elif MARKER_STALE in line and MARKER_STALE_CLEARING not in line:
             events.append(LogEvent("stale", last_ts))
     return events
 

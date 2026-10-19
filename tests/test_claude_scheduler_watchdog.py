@@ -7,6 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notifiers"))
 
 import claude_scheduler_watchdog as mod  # noqa: E402
@@ -39,6 +41,19 @@ NORMAL_SPAWN = (
     "lastRunAt: '2026-08-20T19:06:18.415Z', missed: undefined }"
 )
 NORMAL_CONFIRM = "2026-08-20 12:06:18 [info] [CCDScheduledTasks] Confirmed task run for: process-replies"
+
+CLEARING_STALE_LINES = [
+    "2026-10-17 06:57:29 [info] [oauth] clearing latched session_stale_relogin failures",
+    "2026-10-19 01:15:24 [info] [oauth] clearing latched session_stale_relogin failures",
+]
+STALE_FAILURE_LINES = [
+    "2026-10-17 04:03:50 [info] oauth failed: authorize returned 403 "
+    "<json error=permission_error code=session_stale_relogin len=238>",
+    STALE_LINES[2],
+    # Org id anonymized from the real log; the failure text is unchanged.
+    "2026-10-17 04:03:50 [info] [oauth-v2] fresh exchange failed "
+    "for orgId=example-org (session_stale_relogin)",
+]
 
 # One task times out while an unrelated one keeps running fine (no stale login).
 SPAWN_A = (
@@ -83,6 +98,28 @@ def window_hours_for(oldest="2026-08-18 12:05:52"):
 
 
 class TestParseEvents:
+    @pytest.mark.parametrize("line", CLEARING_STALE_LINES)
+    def test_clearing_stale_flag_does_not_open_incident(self, line):
+        events = mod.parse_events([line])
+        assert events == []
+        state = {}
+        result = mod.evaluate(state, events, now=mod.parse_line_ts(line))
+        assert not result.incident_active
+        assert result.alert_message is None
+        assert state.get("active_incident") is None
+
+    @pytest.mark.parametrize("line", STALE_FAILURE_LINES)
+    def test_actual_stale_failures_still_open_incident(self, line):
+        events = mod.parse_events([line])
+        assert [event.kind for event in events] == ["stale"]
+        result = mod.evaluate({}, events, now=mod.parse_line_ts(line))
+        assert result.incident_active
+        assert result.alert_message is not None
+
+    def test_clearing_line_does_not_hide_a_later_failure(self):
+        events = mod.parse_events(CLEARING_STALE_LINES[:1] + STALE_FAILURE_LINES[:1])
+        assert [event.kind for event in events] == ["stale"]
+
     def test_extracts_all_event_kinds(self):
         events = mod.parse_events([SPAWN_LINE, NORMAL_CONFIRM, CLEARED_LINE] + STALE_LINES)
         kinds = [e.kind for e in events]
