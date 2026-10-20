@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Fetch Slickdeals RSS results and print fresh, not-yet-seen matches.
 
-Two independent trackers:
+Three independent trackers:
 
 1. KEYWORDS — frontpage-only search (editor-vetted deals) for the standing
    wishlist. Low volume, high signal.
 2. DELL — full-site search for deals actually *sold by dell.com*, so the Dell
    statement credit can be applied. Brand-only hits (a Dell monitor sold by
    Best Buy / Amazon / B&H) are rejected: the credit does not work there.
+3. STORAGE — frontpage-only search for external/portable SSDs >= 4 TB and
+   external/desktop hard drives >= 8 TB (notify-shim#53). Capacity comes only
+   from structured tokens ("4TB", "4000 GB"); a storage deal whose capacity
+   can't be read is still sent, tagged 容量未判定, rather than dropped.
 
 Cross-day dedup: every delivered deal is recorded in STATE_PATH so the daily
 run never re-sends the same thread. Without this the 72h window meant one deal
@@ -52,6 +56,31 @@ DELL_QUERIES = [
 # Dell statement credit expiry (Amex-style half-year window; forfeited if
 # unspent). Override with SLICKDEALS_DELL_CREDIT_EXPIRY=YYYY-MM-DD.
 DELL_CREDIT_EXPIRY = os.environ.get("SLICKDEALS_DELL_CREDIT_EXPIRY", "2026-12-31")
+
+# Frontpage title searches for the storage tracker; classify_storage() filters.
+STORAGE_QUERIES = [
+    "ssd",
+    "hard drive",
+    "hdd",
+]
+STORAGE_TAG = "💾 儲存"
+SSD_MIN_TB = 4.0
+HDD_MIN_TB = 8.0
+
+# Structured capacity token. Several tokens (1TB/2TB/5TB variants) -> the
+# largest; a multi-pack "2x 4TB" is per-unit 4TB, which is what matters.
+CAPACITY_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*(tb|gb)\b", re.I)
+SSD_RE = re.compile(r"\bssds?\b|\bsolid[- ]state\b", re.I)
+HDD_RE = re.compile(r"\bhdds?\b|\bhard\s*(?:drive|disk)s?\b", re.I)
+# SSD markers: internal-only (M.2/NVMe stick) vs. explicitly external.
+SSD_INTERNAL_RE = re.compile(r"\bm\.2\b|\bnvme\b|\binternal\b|\bpcie\b", re.I)
+SSD_EXTERNAL_RE = re.compile(r"\bportable\b|\bexternal\b|\busb\w*|\bthunderbolt\b|\benclosure\b", re.I)
+# A whole computer/device that merely ships with a drive is not a drive deal.
+STORAGE_DEVICE_RE = re.compile(
+    r"\b(?:laptops?|notebooks?|macbook\w*|chromebooks?|tablets?|ipad\w*|consoles?|"
+    r"steam\s*deck|phones?|mini\s*pc|gaming\s*pc|desktop\s*(?:pc|computer))\b",
+    re.I,
+)
 
 BLOCK_TITLE_SUBSTRINGS = [
     "expired",
@@ -159,7 +188,36 @@ def sold_by_dell(title: str, blob: str) -> bool:
     return not RIVAL_RETAILER_RE.search(title)
 
 
-def collect(queries, mode, now, max_age_hours, dell_only=False):
+def storage_capacity_tb(title: str):
+    """Largest structured capacity token in the title, in TB; None if absent."""
+    values = []
+    for number, unit in CAPACITY_RE.findall(title):
+        value = float(number)
+        values.append(value if unit.lower() == "tb" else value / 1000)
+    return max(values) if values else None
+
+
+def classify_storage(title: str):
+    """Storage-tracker label for a title, or None when it's out of scope."""
+    if STORAGE_DEVICE_RE.search(title):
+        return None
+    if SSD_RE.search(title):
+        if SSD_INTERNAL_RE.search(title) and not SSD_EXTERNAL_RE.search(title):
+            return None
+        kind, label, minimum = "ssd", "SSD", SSD_MIN_TB
+    elif HDD_RE.search(title):
+        kind, label, minimum = "hdd", "硬碟", HDD_MIN_TB
+    else:
+        return None
+    capacity = storage_capacity_tb(title)
+    if capacity is None:
+        return "容量未判定"
+    if capacity < minimum:
+        return None
+    return f"{label} {capacity:g}TB"
+
+
+def collect(queries, mode, now, max_age_hours, dell_only=False, storage=False):
     """Return [(age_hours, tag, title, link)] for fresh, in-scope items."""
     seen_pairs = set()
     found = []
@@ -183,6 +241,9 @@ def collect(queries, mode, now, max_age_hours, dell_only=False):
 
             if dell_only and not sold_by_dell(title, item_blob(item)):
                 continue
+            storage_label = classify_storage(title) if storage else None
+            if storage and storage_label is None:
+                continue
 
             published = item_pubdate(item)
             if published is None:
@@ -193,7 +254,12 @@ def collect(queries, mode, now, max_age_hours, dell_only=False):
                 ).total_seconds() / 3600
                 if age_hours > max_age_hours:
                     continue
-            tag = "dell.com" if dell_only else query
+            if dell_only:
+                tag = "dell.com"
+            elif storage:
+                tag = f"{STORAGE_TAG}｜{storage_label}"
+            else:
+                tag = query
             found.append((age_hours if age_hours is not None else 10**9, tag, title, link))
     return found
 
@@ -231,6 +297,7 @@ def main() -> int:
     now = dt.datetime.now(dt.timezone.utc)
     matches = collect(KEYWORDS, "frontpage", now, args.max_age_hours)
     matches += collect(DELL_QUERIES, "", now, args.max_age_hours, dell_only=True)
+    matches += collect(STORAGE_QUERIES, "frontpage", now, args.max_age_hours, storage=True)
 
     seen = {} if args.no_state else load_state()
     fresh = []
