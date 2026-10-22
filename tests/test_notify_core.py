@@ -687,6 +687,62 @@ def _result_main(capsys, args, attempt="att-1"):
     return rc, result
 
 
+def test_media_cli_fans_out_to_every_enabled_channel(monkeypatch, result_routes, capsys, tmp_path):
+    image = tmp_path / "test image.jpg"
+    image.write_bytes(b"synthetic fixture")
+    run = make_run(fail_targets={"Uabc"})
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    rc, result = _result_main(capsys, ["--route", "dm", "-m", "caption", "--routes",
+                                      result_routes, "--media", str(image)])
+    assert rc == 0 and result["status"] == "delivered"
+    assert result["delivered_channels"] == ["telegram"]
+    assert result["failed_channels"] == ["line"]
+    assert len(run.calls) == 2
+    for cmd in run.calls:
+        assert cmd[cmd.index("--media") + 1] == str(image)
+        assert cmd[cmd.index("--message") + 1] == "caption"
+
+
+@pytest.mark.parametrize("filename", ["missing.jpg", "."])
+def test_invalid_media_is_error_before_any_send(monkeypatch, result_routes, capsys,
+                                               tmp_path, filename):
+    run = make_run()
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    rc, result = _result_main(capsys, ["--route", "dm", "-m", "caption", "--routes",
+                                      result_routes, "--media", str(tmp_path / filename)])
+    assert rc == 2 and result["status"] == "error"
+    assert run.calls == []
+
+
+@pytest.mark.parametrize("route,dry_run,status,rc", [
+    ("all-off", False, "disabled", 3),
+    ("dm", True, "dry_run", 4),
+])
+def test_media_disabled_and_dry_run_never_send(monkeypatch, result_routes, capsys,
+                                              tmp_path, route, dry_run, status, rc):
+    image = tmp_path / "test.jpg"
+    image.write_bytes(b"synthetic fixture")
+    monkeypatch.setattr(notify_core.subprocess, "run",
+                        lambda *a, **k: pytest.fail("must not send"))
+    args = ["--route", route, "-m", "caption", "--routes", result_routes,
+            "--media", str(image)]
+    if dry_run:
+        args.append("--dry-run")
+    actual_rc, result = _result_main(capsys, args)
+    assert (actual_rc, result["status"]) == (rc, status)
+    assert result["delivered_channels"] == []
+
+
+def test_default_mode_forwards_media(monkeypatch, result_routes, tmp_path):
+    image = tmp_path / "test.jpg"
+    image.write_bytes(b"synthetic fixture")
+    run = make_run()
+    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    assert notify_core.main(["--route", "solo", "-m", "caption", "--routes",
+                             result_routes, "--media", str(image)]) == 0
+    assert run.calls[0][run.calls[0].index("--media") + 1] == str(image)
+
+
 @pytest.mark.parametrize("route,fail,status,delivered,failed", [
     ("solo", set(), "delivered", ["telegram"], []),
     ("dm", set(), "delivered", ["telegram", "line"], []),
