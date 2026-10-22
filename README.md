@@ -31,7 +31,24 @@ echo "multi-line\nbody" | notify-dm
 notify-group-couple "這週要買的東西…"
 notify-group-family --dry-run "尤家人群預覽"
 notify-dm --dry-run "preview, nothing is sent"
+notify-dm --media "/absolute/path/test image.jpg" "image caption"
+notify-dm --result-json --attempt-id image-check-1 --media "/absolute/path/test image.jpg" "image caption"
 ```
+
+`--media` attaches one readable local file to every enabled channel using
+OpenClaw's existing media transport. Text remains required, and text-only
+calls keep their existing behavior. The path is checked before any channel
+sends; a missing, unreadable or non-file path is an error (exit 2, `error`
+in result mode). `--dry-run` validates it but sends nothing. An all-disabled
+route sends nothing and retains its existing default/result-mode exit codes.
+The result contract stays at version 1, including partial-channel outcomes;
+`disabled` is only returned when no channel was attempted.
+
+S9 deployment verification (ideas#41): after the formal notify-shim deploy,
+send one synthetic test image through the DM shim and retain the result JSON.
+Leave ideas#41 open with `blocked-yuting` until Yuting confirms seeing the
+image on every enabled DM channel. API acceptance alone does not complete
+that visual check. This transport change installs no new delivery schedule.
 
 Exit code: **0 if at least one channel delivered.** A per-channel summary is
 always printed to stderr, so a Telegram success never silently hides a LINE

@@ -473,7 +473,7 @@ def route_send_budget(route: str, *, routes_path: str | None = None,
 
 def send_one(channel: str, target: str, message: str, *, dry_run: bool,
              openclaw_bin: str | None = None,
-             timeout: int = SEND_TIMEOUT_SECONDS):
+             timeout: int = SEND_TIMEOUT_SECONDS, media: str | None = None):
     """Send to one channel. Return ``(ok: bool, detail: str)`` — never raises.
 
     A bounded timeout plus catching every OSError (not just a missing binary)
@@ -486,8 +486,12 @@ def send_one(channel: str, target: str, message: str, *, dry_run: bool,
     binary = openclaw_bin or find_openclaw()
     cmd = [binary, "message", "send",
            "--channel", channel, "--target", target, "--message", message]
+    if media is not None:
+        cmd += ["--media", media]
     if dry_run:
-        return True, "dry-run (not sent): " + " ".join(cmd[:-1] + ["<message>"])
+        preview = list(cmd)
+        preview[preview.index("--message") + 1] = "<message>"
+        return True, "dry-run (not sent): " + " ".join(preview)
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               env=_env_with_binary_on_path(binary), timeout=timeout)
@@ -499,7 +503,7 @@ def send_one(channel: str, target: str, message: str, *, dry_run: bool,
 
 
 def notify(route: str, message: str, *, routes_path: str | None = None,
-           dry_run: bool = False, notes=None):
+           dry_run: bool = False, notes=None, media: str | None = None):
     """Fan ``message`` out to every channel of ``route``.
 
     Returns a list of ``(channel, target, ok, detail)`` tuples.
@@ -513,15 +517,29 @@ def notify(route: str, message: str, *, routes_path: str | None = None,
     if not channels:
         raise ValueError(f"route '{route}' has no channels configured")
 
+    # Validate the shared attachment before the first channel can send. A bad
+    # path must be a caller error, never partial text-only delivery.
+    if media is not None:
+        try:
+            path = Path(media).expanduser().resolve(strict=True)
+            if not path.is_file():
+                raise ValueError("not a file")
+            with path.open("rb"):
+                pass
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ValueError("media must be a readable local file") from exc
+        media = str(path)
+
     results = []
     for ch in channels:
         # A channel can be turned off with "enabled": false (default true),
         # so toggling where notifications go is a one-field edit in routes.json.
         if not ch.get("enabled", True):
             continue
-        ok, detail = send_one(
-            ch["channel"], ch["target"], message, dry_run=dry_run
-        )
+        kwargs = {"dry_run": dry_run}
+        if media is not None:
+            kwargs["media"] = media
+        ok, detail = send_one(ch["channel"], ch["target"], message, **kwargs)
         results.append((ch["channel"], ch["target"], ok, detail))
     _record_ledger(route, results, dry_run=dry_run, notes=notes)
     return results
@@ -609,7 +627,7 @@ def _main_result_json(args) -> int:
     notes: list[str] = []
     try:
         results = notify(args.route, message, routes_path=args.routes,
-                         dry_run=args.dry_run, notes=notes)
+                         dry_run=args.dry_run, notes=notes, media=args.media)
     except (FileNotFoundError, KeyError, ValueError) as exc:
         print(f"notify: {exc}", file=sys.stderr)
         return _emit_result(attempt_id, args.route, "error",
@@ -652,6 +670,7 @@ def main(argv=None) -> int:
     ap.add_argument("-m", "--message", help="message text (else positional, else stdin)")
     ap.add_argument("words", nargs="*", help="message text as positional words")
     ap.add_argument("--routes", help="explicit routes.json path")
+    ap.add_argument("--media", help="attach a readable local media file to every enabled channel")
     ap.add_argument("--dry-run", action="store_true",
                     help="print what would be sent; do NOT call openclaw")
     ap.add_argument("--result-json", action="store_true",
@@ -681,7 +700,7 @@ def main(argv=None) -> int:
     try:
         results = notify(args.route, message,
                          routes_path=args.routes, dry_run=args.dry_run,
-                         notes=notes)
+                         notes=notes, media=args.media)
     except (FileNotFoundError, KeyError, ValueError) as exc:
         print(f"notify: {exc}", file=sys.stderr)
         return 2
