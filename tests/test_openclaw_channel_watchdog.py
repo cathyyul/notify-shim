@@ -650,6 +650,123 @@ def test_restart_failure_keeps_alerting_without_poll_sleep(monkeypatch, tmp_path
     assert json.loads(state_file.read_text())["recovery"]["status"] == "gateway_restart_failed"
 
 
+def test_restart_timeout_defers_alert_and_preserves_first_results(monkeypatch, tmp_path):
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(sys, "argv", _watchdog_argv(
+        tmp_path, state_file, tmp_path / "config.json", tmp_path / "notify"))
+    results = [mod.CheckResult("whatsapp", False, "whatsapp_probe_error", "probe timed out")]
+    calls = []
+    monkeypatch.setattr(mod, "evaluate_channels", lambda *a, **k: calls.append(1) or results)
+    monkeypatch.setattr(mod, "send_notification", lambda *a: pytest.fail("pending must be silent"))
+    monkeypatch.setattr(mod.time, "sleep", lambda *a: pytest.fail("wait for next tick"))
+
+    def command(argv, timeout):
+        assert argv == ["openclaw", "gateway", "restart"]
+        raise subprocess.TimeoutExpired(argv, timeout)
+
+    monkeypatch.setattr(mod, "run_command", command)
+    assert mod.main() == 1
+    saved = json.loads(state_file.read_text())
+    assert saved["recovery"]["status"] == "gateway_restart_pending"
+    assert saved["active_incident"]["restart_pending_since"]
+    assert saved["active_incident"]["pre_restart_results"] == saved["results"]
+    assert saved["active_incident"]["last_alert_at"] is None
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("healthy,channel", [(True, "line"), (False, "line"), (False, "whatsapp")])
+def test_pending_restart_next_tick_checks_without_restarting(monkeypatch, tmp_path, healthy, channel):
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(sys, "argv", _watchdog_argv(
+        tmp_path, state_file, tmp_path / "config.json", tmp_path / "notify"))
+    started = mod.now_utc() - mod.dt.timedelta(minutes=5, seconds=1)
+    original = [{"channel": "whatsapp", "ok": False, "status": "whatsapp_probe_error",
+                 "detail": "slow", "suggested_next_step": ""}]
+    state_file.write_text(json.dumps({"active_incident": {
+        "key": "whatsapp", "restart_attempted_at": started.isoformat(),
+        "restart_pending_since": started.isoformat(), "restart_succeeded": None,
+        "last_alert_at": None, "pre_restart_results": original,
+    }}))
+    monkeypatch.setattr(mod, "evaluate_channels", lambda *a, **k: [
+        mod.CheckResult(channel, healthy, "healthy" if healthy else mod.WHATSAPP_LOGGED_OUT_STATUS,
+                        "current state")])
+    monkeypatch.setattr(mod, "restart_gateway", lambda *a, **k: pytest.fail("already requested"))
+    monkeypatch.setattr(mod, "gateway_sigterm_evidence", lambda *a, **k: {"status": "not_observed"}, raising=False)
+    messages = []
+    monkeypatch.setattr(mod, "send_notification", lambda message, notify_bin: messages.append(message))
+    assert mod.main() == (0 if healthy else 1)
+    saved = json.loads(state_file.read_text())
+    if healthy:
+        assert not messages
+        assert "active_incident" not in saved
+        assert saved["auto_recovered"]["restart_at"] == started.isoformat()
+        assert saved["auto_recovered"]["pre_restart_results"] == original
+    else:
+        assert len(messages) == 1
+        assert "已請求重啟、5 分鐘後仍未恢復" in messages[0]
+        assert "重啟指令失敗" not in messages[0]
+        assert "received SIGTERM" in messages[0]
+        assert saved["active_incident"]["pre_restart_results"] == original
+        assert saved["active_incident"]["post_restart_results"] == saved["results"]
+
+
+def test_successful_restart_keeps_pre_restart_diagnostics(monkeypatch, tmp_path):
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(sys, "argv", _watchdog_argv(
+        tmp_path, state_file, tmp_path / "config.json", tmp_path / "notify"))
+    before = mod.CheckResult("line", False, "bad", "original failure")
+    results = iter([[before], [mod.CheckResult("line", True, "healthy", "ok")]])
+    monkeypatch.setattr(mod, "evaluate_channels", lambda *a, **k: next(results))
+    monkeypatch.setattr(mod, "restart_gateway", lambda *a, **k:
+                        mod.CheckResult("gateway", True, "gateway_restart_ok", "ok"))
+    monkeypatch.setattr(mod.time, "sleep", lambda *a: None)
+    monkeypatch.setattr(mod, "send_notification", lambda *a: pytest.fail("recovered"))
+    assert mod.main() == 0
+    assert json.loads(state_file.read_text())["auto_recovered"]["pre_restart_results"] == [mod.asdict(before)]
+
+
+@pytest.mark.parametrize("age_minutes,expected_notifications", [(1, 0), (6, 1)])
+def test_pending_restart_waits_five_minutes_then_uses_existing_cooldown(
+        monkeypatch, tmp_path, age_minutes, expected_notifications):
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(sys, "argv", _watchdog_argv(
+        tmp_path, state_file, tmp_path / "config.json", tmp_path / "notify"))
+    started = (mod.now_utc() - mod.dt.timedelta(minutes=age_minutes)).isoformat()
+    state_file.write_text(json.dumps({"active_incident": {
+        "key": "whatsapp", "restart_attempted_at": started,
+        "restart_pending_since": started, "last_alert_at": None,
+    }}))
+    monkeypatch.setattr(mod, "evaluate_channels", lambda *a, **k: [
+        mod.CheckResult("line", False, "bad", "different failing channel")])
+    monkeypatch.setattr(mod, "restart_gateway", lambda *a, **k: pytest.fail("already requested"))
+    monkeypatch.setattr(mod, "gateway_sigterm_evidence", lambda *a, **k: {"status": "unavailable"}, raising=False)
+    messages = []
+    monkeypatch.setattr(mod, "send_notification", lambda message, notify_bin: messages.append(message))
+    assert mod.main() == 1
+    assert mod.main() == 1
+    assert len(messages) == expected_notifications
+
+
+@pytest.mark.parametrize("event_offset,status", [(-1, "not_observed"), (30, "observed"), (600, "not_observed")])
+def test_sigterm_evidence_excludes_other_incidents_and_future_events(monkeypatch, tmp_path, event_offset, status):
+    now = mod.dt.datetime(2026, 10, 26, 20, tzinfo=mod.dt.timezone.utc)
+    started = now - mod.dt.timedelta(minutes=5)
+    monkeypatch.setattr(mod, "now_utc", lambda: now)
+    monkeypatch.setattr(mod, "GATEWAY_LOG_DIR", tmp_path, raising=False)
+    event = {"time": (started + mod.dt.timedelta(seconds=event_offset)).isoformat(),
+             "message": "received SIGTERM; restarting"}
+    path = tmp_path / f"openclaw-{now.astimezone().date().isoformat()}.log"
+    path.write_text('invalid received SIGTERM\n' + json.dumps(event) + '\n')
+    evidence = mod.gateway_sigterm_evidence(started.isoformat())
+    assert evidence["status"] == status
+    assert "message" not in evidence
+
+
+def test_sigterm_evidence_unavailable_is_not_absence(monkeypatch, tmp_path):
+    monkeypatch.setattr(mod, "GATEWAY_LOG_DIR", tmp_path, raising=False)
+    assert mod.gateway_sigterm_evidence(mod.iso_now()) == {"status": "unavailable"}
+
+
 def test_health_checks_share_tick_budget_and_reserve_notification(monkeypatch, tmp_path):
     clock = [0.0]
     monkeypatch.setattr(mod.time, "monotonic", lambda: clock[0])

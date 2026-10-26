@@ -41,6 +41,8 @@ DEFAULT_NOTIFY_DM_BIN = WORKSPACE / "scripts" / "notify-dm"
 #: Generous on purpose: over-waiting costs a slow watchdog tick, while
 #: under-waiting costs the alert entirely (notify-shim#35).
 FALLBACK_NOTIFY_TIMEOUT_SECONDS = 300
+RESTART_PENDING_RECHECK_SECONDS = 300
+GATEWAY_LOG_DIR = Path("/tmp/openclaw")
 
 
 @dataclass
@@ -402,7 +404,13 @@ def format_alert(results: list[CheckResult], recovery_mode: str,
     attempted = (incident or {}).get("restart_attempted_at")
     if attempted:
         elapsed = (incident or {}).get("post_restart_elapsed_seconds")
-        if (incident or {}).get("restart_succeeded") is False:
+        if (incident or {}).get("restart_pending_since"):
+            lines.insert(0, f"已請求重啟、5 分鐘後仍未恢復（請求時間 {attempted}）；本事件不再重啟。")
+            evidence = (incident or {}).get("sigterm_evidence", {})
+            status = evidence.get("status")
+            fact = {"observed": "已觀察到", "not_observed": "可讀取的近期日誌中未觀察到"}.get(status, "日誌不可讀，無法核實")
+            lines.append(f"Gateway log: {fact} received SIGTERM（僅查本次請求後）。")
+        elif (incident or {}).get("restart_succeeded") is False:
             lines.insert(0, f"已於 {attempted} 嘗試自動重啟 gateway，但重啟指令失敗。")
         elif elapsed is not None:
             lines.insert(0, f"已於 {attempted} 自動重啟 gateway，等 {elapsed:g} 秒仍未恢復；本事件已自動重啟過。")
@@ -432,7 +440,7 @@ def incident_key(results: list[CheckResult]) -> str:
 
 def active_incident(state: dict[str, Any], key: str) -> dict[str, Any]:
     current = state.get("active_incident")
-    if isinstance(current, dict) and current.get("key") == key:
+    if isinstance(current, dict) and (current.get("key") == key or current.get("restart_pending_since")):
         return current
     return {
         "key": key,
@@ -488,6 +496,9 @@ def send_notification(message: str, notify_bin: Path) -> None:
 def restart_gateway(openclaw_bin: str, timeout: float = 60) -> CheckResult:
     try:
         proc = run_command([openclaw_bin, "gateway", "restart"], timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return CheckResult("gateway", False, "gateway_restart_pending",
+                           "Gateway restart requested; CLI timed out before completion could be verified")
     except Exception as exc:
         return CheckResult("gateway", False, "gateway_restart_error",
                            f"Failed to run gateway restart: {exc}")
@@ -497,6 +508,43 @@ def restart_gateway(openclaw_bin: str, timeout: float = 60) -> CheckResult:
     detail = (proc.stdout + proc.stderr).strip()
     return CheckResult("gateway", False, "gateway_restart_failed",
                        f"openclaw gateway restart exited {proc.returncode}: {detail[:240]}")
+
+
+def gateway_sigterm_evidence(since: str) -> dict[str, Any]:
+    """Report only timestamped evidence, never copy gateway log contents into alerts."""
+    started = parse_ts(since)
+    if started is None:
+        return {"status": "unavailable"}
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=dt.timezone.utc)
+    current = now_utc()
+    readable = False
+    # A pending restart normally spans five minutes; include both dates for midnight.
+    for day in sorted({started.astimezone().date(), current.astimezone().date()}):
+        path = GATEWAY_LOG_DIR / f"openclaw-{day.isoformat()}.log"
+        try:
+            with path.open("rb") as log:
+                # Bound diagnostic I/O; an old/rotated event may be unobserved,
+                # which is explicitly not proof that SIGTERM never happened.
+                size = log.seek(0, os.SEEK_END)
+                offset = max(0, size - 2 * 1024 * 1024)
+                log.seek(offset)
+                lines = log.read(2 * 1024 * 1024).decode("utf-8", errors="replace").splitlines()
+                for line in lines[1:] if offset else lines:
+                    if "received SIGTERM" not in line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        timestamp = parse_ts(record.get("time", "").replace("Z", "+00:00"))
+                    except (ValueError, TypeError, AttributeError):
+                        continue
+                    if (timestamp is not None and timestamp.tzinfo is not None
+                            and started <= timestamp <= current):
+                        return {"status": "observed", "at": timestamp.isoformat()}
+            readable = True
+        except OSError:
+            continue
+    return {"status": "not_observed" if readable else "unavailable"}
 
 
 def maybe_notify(unhealthy: list[CheckResult], recovery_mode: str, notify_bin: Path,
@@ -588,6 +636,15 @@ def main() -> int:
         incident: dict[str, Any] | None = None
         notified = False
 
+        previous_incident = state.get("active_incident")
+        if (not unhealthy and isinstance(previous_incident, dict)
+                and previous_incident.get("restart_pending_since")):
+            state["auto_recovered"] = {
+                "restart_at": previous_incident["restart_attempted_at"],
+                "recovered_at": iso_now(),
+                "pre_restart_results": previous_incident.get("pre_restart_results", []),
+            }
+
         if unhealthy:
             key = incident_key(unhealthy)
             incident = active_incident(state, key)
@@ -597,7 +654,18 @@ def main() -> int:
             restart_is_futile = all(
                 result.status == WHATSAPP_LOGGED_OUT_STATUS for result in unhealthy
             )
-            if args.recovery_mode == "restart" and restart_is_futile:
+            if incident.get("restart_pending_since"):
+                # Preserve this incident even if the set of failing channels changes
+                # during restart. A timed-out request must never trigger another restart.
+                recovery_result = CheckResult("gateway", False, "gateway_restart_pending",
+                                              "Restart already requested; checking recovery on later ticks")
+                incident["post_restart_results"] = [asdict(result) for result in results]
+                if cooldown_elapsed(incident, "restart_pending_since", RESTART_PENDING_RECHECK_SECONDS / 60):
+                    incident["sigterm_evidence"] = gateway_sigterm_evidence(incident["restart_pending_since"])
+                    if args.notify:
+                        notified = maybe_notify(unhealthy, args.recovery_mode, args.notify_bin,
+                                                incident, args.cooldown_minutes)
+            elif args.recovery_mode == "restart" and restart_is_futile:
                 recovery_result = CheckResult(
                     "gateway", True, GATEWAY_RESTART_SKIPPED_STATUS,
                     "WhatsApp session was logged out by the server; a gateway restart cannot "
@@ -611,13 +679,17 @@ def main() -> int:
             elif args.recovery_mode == "restart":
                 if not incident.get("restart_attempted_at"):
                     incident["restart_attempted_at"] = iso_now()
+                    incident["pre_restart_results"] = [asdict(result) for result in results]
                     remaining = health_deadline - time.monotonic()
                     if remaining > 0:
                         recovery_result = restart_gateway(args.openclaw_bin, timeout=min(60, remaining))
                     else:
                         recovery_result = CheckResult("gateway", False, "gateway_restart_error",
                                                       "No remaining time budget for gateway restart")
-                    incident["restart_succeeded"] = recovery_result.ok
+                    pending = recovery_result.status == "gateway_restart_pending"
+                    incident["restart_succeeded"] = None if pending else recovery_result.ok
+                    if pending:
+                        incident["restart_pending_since"] = incident["restart_attempted_at"]
                     poll_started = time.monotonic()
                     if recovery_result.ok:
                         poll_deadline = min(poll_started + args.post_restart_timeout_sec, health_deadline)
@@ -632,7 +704,7 @@ def main() -> int:
                             if all(result.ok for result in results):
                                 break
                         incident["post_restart_elapsed_seconds"] = round(time.monotonic() - poll_started, 3)
-                    else:
+                    elif not pending:
                         results = evaluate_channels(
                             args.channels, config, args.gateway_port, args.timeout_ms,
                             args.openclaw_bin, deadline=health_deadline,
@@ -644,8 +716,9 @@ def main() -> int:
                             "restart_at": incident["restart_attempted_at"],
                             "recovered_at": iso_now(),
                             "elapsed_seconds": incident["post_restart_elapsed_seconds"],
+                            "pre_restart_results": incident["pre_restart_results"],
                         }
-                    if unhealthy and args.notify:
+                    if unhealthy and args.notify and not pending:
                         notified = maybe_notify(
                             unhealthy, args.recovery_mode, args.notify_bin,
                             incident, args.cooldown_minutes,
