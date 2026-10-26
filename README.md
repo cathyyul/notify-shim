@@ -361,11 +361,25 @@ recovery time, and elapsed seconds) in state and JSON logs. Timeout alerts and
 later cooldown reminders say the gateway was already restarted and recommend
 status/log inspection. WhatsApp logout still requires relinking, not restarting.
 
+A restart CLI timeout means completion is unknown: state records
+`gateway_restart_pending` and `restart_pending_since`, and that tick neither
+polls again nor alerts. Later ticks check channel health without another restart.
+A healthy tick records `auto_recovered` silently; if still unhealthy after five
+minutes, the alert says the requested restart has not restored health and reports
+whether a timestamped `received SIGTERM` was observed since the request. This
+diagnostic reads at most the last 2 MiB of each relevant gateway daily log;
+unobserved or unreadable logs do not prove that no restart happened. Existing
+alert cooldowns still apply. Restart commands continue to omit `--force`.
+`pre_restart_results` preserves the initial checks in the incident and, on
+recovery, in `auto_recovered`, even when subsequent checks overwrite `results`.
+
 Incident reset behavior:
 - The active incident is keyed by failing channel set, e.g. `line`,
   `whatsapp`, or `line|whatsapp`.
 - A changing failure detail for the same still-unhealthy channel is treated as
   the same incident, so it does not get another restart attempt.
+- A pending restart also retains its incident when the failing channel set
+  changes, until a fully healthy tick clears it.
 - After any run where all requested channels are healthy, the watchdog removes
   `active_incident`; a later failure is then treated as a fresh incident and may
   restart once again.
