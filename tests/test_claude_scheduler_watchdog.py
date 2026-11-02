@@ -65,13 +65,13 @@ CONFIRM_B = ("2026-08-22 09:30:00 [info] [CCDScheduledTasks] "
              "Confirmed task run for: travel-concierge-update")
 
 # Quota case (real 2026-09-05 daily-memory-sync sequence): spawn → Confirmed →
-# start-timing binds the session id → CycleHealth api_error on a session limit.
+# immediate launch binds the session id → CycleHealth api_error on a session limit.
 USAGE_SPAWN = ("2026-09-05 23:03:49 [info] [CCDScheduledTasks] Spawning new session "
                "for scheduled task daily-memory-sync { cronExpression: '0 23 * * *' }")
 USAGE_CONFIRM = ("2026-09-05 23:03:49 [info] [CCDScheduledTasks] "
                  "Confirmed task run for: daily-memory-sync")
-USAGE_START = ("2026-09-05 23:03:50 [info] [CCD start-timing] "
-               "local_567d68b6-f2ec-4698-ac85-b3f0dda33556 preflight=5ms init=842")
+USAGE_START = ("2026-09-05 23:03:50 [info] Starting local session "
+               "local_567d68b6-f2ec-4698-ac85-b3f0dda33556 in /fixture")
 USAGE_APIERR = ("2026-09-05 23:03:50 [warn] [CCD CycleHealth] "
                 "local_567d68b6-f2ec-4698-ac85-b3f0dda33556 api_error (success): "
                 "You've hit your session limit · resets 12am (America/Los_Angeles)")
@@ -1504,18 +1504,20 @@ class TestUsageLimit:
 
 
 class TestUsageLimitBinding:
-    def test_fifo_binding_two_concurrent_spawns(self):
-        # Two tasks spawn before either start-timing → each must bind to its own
-        # session in spawn order (P1: scalar awaiting clobbered the first).
+    def test_launch_binding_ignores_reordered_start_timing(self):
+        # Both tasks launch before their async start-timing messages. Bind at
+        # launch so timing-message order cannot exchange their identities.
         sa = ("2026-09-05 23:00:00 [info] [CCDScheduledTasks] Spawning new session "
               "for scheduled task task-a { cronExpression: '0 23 * * *' }")
         sb = ("2026-09-05 23:00:00 [info] [CCDScheduledTasks] Spawning new session "
               "for scheduled task task-b { cronExpression: '0 23 * * *' }")
-        start_a = "2026-09-05 23:00:01 [info] [CCD start-timing] local_aaaa preflight=5ms"
-        start_b = "2026-09-05 23:00:01 [info] [CCD start-timing] local_bbbb preflight=5ms"
+        start_a = "2026-09-05 23:00:00 [info] Starting local session local_aaaa in /fixture"
+        start_b = "2026-09-05 23:00:00 [info] Starting local session local_bbbb in /fixture"
+        timing_b = "2026-09-05 23:00:01 [info] [CCD start-timing] local_bbbb preflight=5ms"
+        timing_a = "2026-09-05 23:00:01 [info] [CCD start-timing] local_aaaa preflight=5ms"
         err_b = ("2026-09-05 23:00:02 [warn] [CCD CycleHealth] local_bbbb api_error "
                  "(success): You've hit your session limit · resets 12am")
-        events = mod.parse_events([sa, sb, start_a, start_b, err_b])
+        events = mod.parse_events([sa, start_a, sb, start_b, timing_b, timing_a, err_b])
         ul = [e for e in events if e.kind == "usage_limit"]
         assert len(ul) == 1 and ul[0].task == "task-b"  # bbbb → task-b, not task-a
 
@@ -1535,6 +1537,6 @@ class TestUsageLimitBinding:
         for i in range(mod._MAX_SESSION_TASK + 20):
             lines.append(f"2026-09-05 23:00:00 [info] [CCDScheduledTasks] Spawning new "
                          f"session for scheduled task t{i} {{ cronExpression: '* * * * *' }}")
-            lines.append(f"2026-09-05 23:00:01 [info] [CCD start-timing] local_s{i} preflight=1ms")
+            lines.append(f"2026-09-05 23:00:01 [info] Starting local session local_s{i} in /fixture")
         mod.parse_events(lines, session_state=ss)
-        assert len(ss["session_task"]) <= mod._MAX_SESSION_TASK
+        assert len(ss["session_task"]) == mod._MAX_SESSION_TASK

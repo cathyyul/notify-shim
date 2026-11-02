@@ -39,12 +39,9 @@ MARKER_CONFIRM = "[CCDScheduledTasks] Confirmed task run for: "
 MARKER_CLEARED = "[CCDScheduledTasks] Cleared stale pending dispatch for: "
 MARKER_STALE = "session_stale_relogin"
 MARKER_STALE_CLEARING = "clearing latched session_stale_relogin"
-# A scheduled-task session's start-timing line names the session id; the next
-# CycleHealth api_error line for that id (with a usage/session-limit phrase) is
-# the quota signal. We bind session id -> task via these two so a usage-limit
-# failure can be attributed to the right routine — and only to a routine, never
-# to an interactive session that happened to hit the same limit (#30).
-MARKER_START_TIMING = "[CCD start-timing] "
+# Bind the session at its immediate launch, before asynchronous start-timing
+# messages can reorder. Historical FIFO entries must not shift later bindings.
+MARKER_SESSION_START = "Starting local session "
 MARKER_CYCLEHEALTH = "[CCD CycleHealth] "
 # Phrases that mark an api_error as a quota/usage exhaustion (vs any other API
 # error). Matched case-insensitively.
@@ -128,9 +125,9 @@ def _reset_hint(line: str) -> Optional[str]:
     return tail.strip() or None
 
 
-# Bounds on the persisted session-binding maps so they can never grow without
-# limit across runs (spawns whose start-timing / api_error never arrive).
-_MAX_AWAITING = 64
+# Only the most recent spawn may bind the next launch, within a short window.
+_MAX_START_LINES = 20
+_MAX_START_SECONDS = 60
 _MAX_SESSION_TASK = 128
 
 
@@ -139,44 +136,55 @@ def _bounded_pop_oldest(d: "dict[str, Any]", cap: int) -> None:
         d.pop(next(iter(d)))
 
 
-def _bounded_pop_oldest_list(lst: "list[Any]", cap: int) -> None:
-    while len(lst) > cap:
-        lst.pop(0)
-
-
 def parse_events(lines: "list[str]",
                  session_state: "Optional[dict[str, Any]]" = None) -> "list[LogEvent]":
     """Parse log lines into events.
 
     ``session_state`` carries the spawn→session→task binding ACROSS calls
     (#30): the watchdog reads the log incrementally, so a task's spawn, its
-    ``start-timing`` and its ``CycleHealth`` api_error can land in different
+    launch and its ``CycleHealth`` api_error can land in different
     reads. When a persistent dict is passed (main() stores it in the state
     file) the binding survives those boundaries; tests may omit it for a
-    single-call parse. ``awaiting`` is a FIFO queue, not a scalar, so several
-    tasks spawning before their start-timing lines each bind to the right
-    session in spawn order."""
+    single-call parse. A new spawn replaces any unmatched predecessor; only
+    its immediately following, bounded Starting-local-session line may bind.
+    The old FIFO and its potentially shifted maps are discarded once."""
     events: "list[LogEvent]" = []
     last_ts: Optional[dt.datetime] = None
     if session_state is None:
         session_state = {}
-    awaiting: "list[str]" = session_state.setdefault("awaiting", [])
+    if session_state.get("version") != 2:
+        if session_state.get("awaiting") or session_state.get("session_task"):
+            print("binding: discard legacy FIFO and unverified session bindings", file=sys.stderr)
+        session_state.clear()
+        session_state["version"] = 2
     session_task: "dict[str, str]" = session_state.setdefault("session_task", {})
     for line in lines:
         ts = parse_line_ts(line)
         if ts is not None:
             last_ts = ts
+        pending = session_state.get("pending_start")
+        if pending is not None:
+            pending["lines_left"] -= 1
+            spawn_ts = parse_ts(pending["ts"])
+            if pending["lines_left"] < 0 or (ts is not None and
+                    (ts < spawn_ts or (ts - spawn_ts).total_seconds() > _MAX_START_SECONDS)):
+                print(f"binding: discard expired spawn {pending['task']}", file=sys.stderr)
+                session_state.pop("pending_start", None)
         if MARKER_SPAWN in line:
             rest = line.split(MARKER_SPAWN, 1)[1]
             task = rest.split(" ", 1)[0].strip().rstrip("{")
             if task:
                 events.append(LogEvent("spawn", last_ts, task))
-                awaiting.append(task)
-                _bounded_pop_oldest_list(awaiting, _MAX_AWAITING)
-        elif MARKER_START_TIMING in line:
-            sid = _session_id_after(line, MARKER_START_TIMING)
-            if sid and awaiting:
-                session_task[sid] = awaiting.pop(0)  # FIFO: oldest spawn first
+                if session_state.pop("pending_start", None) is not None:
+                    print("binding: discard unmatched spawn before new spawn", file=sys.stderr)
+                if ts is not None:
+                    session_state["pending_start"] = dict(
+                        task=task, ts=fmt_ts(ts), lines_left=_MAX_START_LINES)
+        elif MARKER_SESSION_START in line:
+            sid = _session_id_after(line, MARKER_SESSION_START)
+            pending = session_state.pop("pending_start", None)
+            if sid and pending is not None and ts is not None:
+                session_task[sid] = pending["task"]
                 _bounded_pop_oldest(session_task, _MAX_SESSION_TASK)
         elif MARKER_CYCLEHEALTH in line and "api_error" in line \
                 and any(p in line.lower() for p in LIMIT_PHRASES):
@@ -568,12 +576,10 @@ def evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime
 
 
 def mark_alerted(state: "dict[str, Any]", now: dt.datetime) -> None:
-    """Record that an alert actually reached Yuting.
+    """Consume cooldown for confirmed or timeout-unknown alert delivery.
 
-    Only called after ``notify-dm`` reports success. An alert that failed to
-    send must not consume the cooldown — otherwise a missing or broken shim
-    buys a live incident 12 more hours of the silence this watchdog exists to
-    break.
+    Known failures still retry. A timeout may occur after one channel sent;
+    consume cooldown in that case to avoid hourly duplicate alerts (#61).
     """
     incident = state.get("active_incident")
     if incident is None:
@@ -661,6 +667,13 @@ def _state_is_usable(state: Any) -> bool:
     if not all(isinstance(k, str) and isinstance(v, str)
                for k, v in (sb.get("session_task") or {}).items()):
         return False
+    pending = sb.get("pending_start")
+    if pending is not None:
+        if not isinstance(pending, dict) or not isinstance(pending.get("task"), str) \
+                or not isinstance(pending.get("ts"), str) or parse_ts(pending["ts"]) is None \
+                or not whole_number(pending.get("lines_left")) \
+                or pending["lines_left"] > _MAX_START_LINES:
+            return False
     incident = state.get("active_incident")
     if "active_incident" in state and incident is not None:
         if not isinstance(incident, dict):
@@ -721,13 +734,17 @@ def save_json(path: Path, payload: "dict[str, Any]") -> None:
     os.replace(tmp, path)
 
 
-def send_notification(message: str, notify_bin: Path) -> bool:
-    """Send via the notify-dm shim. Returns True only when it was accepted."""
+def send_notification(message: str, notify_bin: Path) -> Optional[bool]:
+    """True: accepted; False: known failure; None: timeout, delivery unknown."""
     try:
         if not notify_bin.exists():
             print(f"notify: shim not found at {notify_bin}", file=sys.stderr)
             return False
-        proc = subprocess.run([str(notify_bin), message], timeout=30,
+        # Deployed siblings live beside the shim; source lives at repo root.
+        sys.path.insert(0, str(notify_bin.parent))
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import notify_core
+        proc = subprocess.run([str(notify_bin), message], timeout=notify_core.route_send_budget("dm"),
                               capture_output=True, text=True)
         if proc.returncode != 0:
             detail = (proc.stdout + proc.stderr).strip()
@@ -735,6 +752,10 @@ def send_notification(message: str, notify_bin: Path) -> bool:
                   file=sys.stderr)
             return False
         return True
+    except subprocess.TimeoutExpired as exc:
+        print(f"notify: delivery unknown after timeout; suppress duplicate alert within cooldown: {exc}",
+              file=sys.stderr)
+        return None
     except Exception as exc:
         print(f"notify: failed to invoke notify-dm: {exc}", file=sys.stderr)
         return False
@@ -795,13 +816,14 @@ def _run(args: argparse.Namespace, state_problem: Optional[str] = None,
                       blocked_reason=blocked_reason)
 
     notified = False
+    alert_delivery_unknown = False
     if args.notify:
         if result.alert_message:
-            # Consume the cooldown only on confirmed delivery; a failed send
-            # leaves the incident unalerted so the next run retries.
-            if send_notification(result.alert_message, args.notify_bin):
+            delivered = send_notification(result.alert_message, args.notify_bin)
+            if delivered is not False:
                 mark_alerted(state, now)
-                notified = True
+                notified = delivered is True
+                alert_delivery_unknown = delivered is None
         if result.recovery_message:
             if send_notification(result.recovery_message, args.notify_bin):
                 mark_recovered(state)
@@ -819,6 +841,8 @@ def _run(args: argparse.Namespace, state_problem: Optional[str] = None,
         "events": len(events),
         "notified": notified,
     }
+    if alert_delivery_unknown:
+        state["last_result"]["alert_delivery_unknown"] = True
     if blocked_reason:
         state["last_result"]["blocked"] = blocked_reason
     try:
