@@ -37,11 +37,51 @@ def test_direct_start_binds_before_start_timing_and_across_reads():
     assert usage(mod.parse_events([ERROR], state)) == ["thursday-draft"]
 
 
-def test_new_spawn_discards_unmatched_predecessor(capsys):
+def test_spawn_inside_open_window_makes_binding_ambiguous(capsys):
+    # A second spawn before the first one's launch line: launch order is unknown,
+    # so neither launch may be attributed to a task (never attribute to the wrong one).
     state = {}
     mod.parse_events([SPAWN.replace("thursday-draft", "old-task")], state)
-    assert usage(mod.parse_events([SPAWN, START, ERROR], state)) == ["thursday-draft"]
-    assert "discard" in capsys.readouterr().err
+    assert usage(mod.parse_events([SPAWN, START, ERROR], state)) == []
+    assert "ambiguous" in capsys.readouterr().err
+
+
+def _spawn(task, ts="21:28:00"):
+    return SPAWN.replace("thursday-draft", task).replace("21:28:00", ts)
+
+
+def _start(sid, ts="21:28:01"):
+    return START.replace("local_thursday", sid).replace("21:28:00", ts)
+
+
+def _error(sid):
+    return ERROR.replace("local_thursday", sid)
+
+
+def test_interleaved_burst_spawns_never_misattribute():
+    # Wake catch-up (main2.log 2026-10-13 13:35:56): spawn A, spawn B, start, start.
+    state = {}
+    lines = [_spawn("task-a"), _spawn("task-b"), _start("local_1"), _start("local_2"),
+             _error("local_1"), _error("local_2")]
+    assert usage(mod.parse_events(lines, state)) == []
+
+
+def test_burst_straggler_after_next_spawn_keeps_window_ambiguous():
+    # A burst still owes a launch line when another spawn arrives: the next launches
+    # could be the straggler or the new spawn's, so none of them is bound.
+    state = {}
+    lines = [_spawn("task-a"), _spawn("task-b"), _start("local_1"),
+             _spawn("task-c", "21:28:02"), _start("local_2", "21:28:02"),
+             _start("local_3", "21:28:03"),
+             _error("local_1"), _error("local_2"), _error("local_3")]
+    assert usage(mod.parse_events(lines, state)) == []
+
+
+def test_after_burst_resolves_next_spawn_binds_normally():
+    state = {}
+    mod.parse_events([_spawn("task-a"), _spawn("task-b"), _start("local_1"), _start("local_2")], state)
+    lines = [_spawn("task-c", "21:40:00"), _start("local_3", "21:40:00"), _error("local_3")]
+    assert usage(mod.parse_events(lines, state)) == ["task-c"]
 
 
 @pytest.mark.parametrize("gap", ["lines", "time"])
@@ -63,7 +103,11 @@ def test_old_start_timing_alone_does_not_rebind_new_spawn():
 
 @pytest.mark.parametrize("pending", [None, {"task": "task", "ts": 123, "lines_left": 20},
                                      {"task": "task", "ts": "bad", "lines_left": 20},
-                                     {"task": "task", "ts": "2026-11-01 21:28:00", "lines_left": -1}])
+                                     {"task": "task", "ts": "2026-11-01 21:28:00", "lines_left": -1},
+                                     {"task": "", "ts": "2026-11-01 21:28:00", "lines_left": 20,
+                                      "outstanding": 0},
+                                     {"task": "task", "ts": "2026-11-01 21:28:00", "lines_left": 20,
+                                      "outstanding": 2}])
 def test_pending_binding_state_is_validated(pending):
     state = {"session_binding": {"version": 2, "session_task": {}, "pending_start": pending}}
     assert mod._state_is_usable(state) is (pending is None)

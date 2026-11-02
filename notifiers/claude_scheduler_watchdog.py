@@ -175,15 +175,27 @@ def parse_events(lines: "list[str]",
             task = rest.split(" ", 1)[0].strip().rstrip("{")
             if task:
                 events.append(LogEvent("spawn", last_ts, task))
-                if session_state.pop("pending_start", None) is not None:
-                    print("binding: discard unmatched spawn before new spawn", file=sys.stderr)
-                if ts is not None:
+                prior = session_state.pop("pending_start", None)
+                if ts is None:
+                    pass
+                elif prior is not None:
+                    # Spawn burst (e.g. wake catch-up): launch order is unknown, so no
+                    # launch in this window may be bound to a task. Count the spawns
+                    # still owed a launch line so stragglers never bind to a later spawn.
+                    print("binding: ambiguous spawn burst, launches stay unbound", file=sys.stderr)
+                    session_state["pending_start"] = dict(
+                        task="", ts=fmt_ts(ts), lines_left=_MAX_START_LINES,
+                        outstanding=prior.get("outstanding", 1) + 1)
+                else:
                     session_state["pending_start"] = dict(
                         task=task, ts=fmt_ts(ts), lines_left=_MAX_START_LINES)
         elif MARKER_SESSION_START in line:
             sid = _session_id_after(line, MARKER_SESSION_START)
             pending = session_state.pop("pending_start", None)
-            if sid and pending is not None and ts is not None:
+            if pending is not None and pending.get("outstanding", 0) > 1:
+                pending["outstanding"] -= 1
+                session_state["pending_start"] = pending
+            elif sid and pending is not None and pending["task"] and ts is not None:
                 session_task[sid] = pending["task"]
                 _bounded_pop_oldest(session_task, _MAX_SESSION_TASK)
         elif MARKER_CYCLEHEALTH in line and "api_error" in line \
@@ -673,6 +685,12 @@ def _state_is_usable(state: Any) -> bool:
                 or not isinstance(pending.get("ts"), str) or parse_ts(pending["ts"]) is None \
                 or not whole_number(pending.get("lines_left")) \
                 or pending["lines_left"] > _MAX_START_LINES:
+            return False
+        # Ambiguous burst marker: empty task with a positive count; a named task has none.
+        if pending["task"] == "":
+            if not whole_number(pending.get("outstanding")) or pending["outstanding"] < 1:
+                return False
+        elif "outstanding" in pending:
             return False
     incident = state.get("active_incident")
     if "active_incident" in state and incident is not None:
