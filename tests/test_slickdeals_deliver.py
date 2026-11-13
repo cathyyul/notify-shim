@@ -28,11 +28,11 @@ def _run(tmp_path, monitor_body, extra_args=()):
     return proc, sent
 
 
-def test_no_match_still_delivers_summary(tmp_path):
+def test_no_match_logs_without_delivery(tmp_path):
     proc, sent = _run(tmp_path, 'print("Found 0 candidate deals")\n')
     assert proc.returncode == 0, proc.stderr
-    assert sent.exists()  # _deliver always sends (unlike old _notifier)
-    assert "沒有符合條件" in sent.read_text()
+    assert not sent.exists()
+    assert "Found 0 candidate deals" in proc.stdout
 
 
 def test_match_delivers_bullets(tmp_path):
@@ -51,7 +51,7 @@ def test_no_deliver_flag_skips_send(tmp_path):
                       extra_args=("--no-deliver",))
     assert proc.returncode == 0, proc.stderr
     assert not sent.exists()
-    assert "🛒 Slickdeals 監控" in proc.stdout
+    assert "Found 0 candidate deals" in proc.stdout
 
 
 def test_monitor_failure_surfaces_error_and_does_not_send(tmp_path):
@@ -60,3 +60,11 @@ def test_monitor_failure_surfaces_error_and_does_not_send(tmp_path):
     assert proc.returncode != 0
     assert "BOOM monitor crashed" in proc.stderr  # error must not be swallowed
     assert not sent.exists()
+
+
+def test_nonempty_no_deliver_preview_keeps_bullets_without_send(tmp_path):
+    body = 'print("Found 1 candidate deals\\n- [bambu] Printer\\n  https://example.com/deal")\n'
+    proc, sent = _run(tmp_path, body, extra_args=("--no-deliver",))
+    assert proc.returncode == 0, proc.stderr
+    assert not sent.exists()
+    assert '• [bambu] Printer' in proc.stdout and 'https://example.com/deal' in proc.stdout

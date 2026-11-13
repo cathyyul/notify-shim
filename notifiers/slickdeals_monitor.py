@@ -53,9 +53,9 @@ DELL_QUERIES = [
     "dell coupon",
 ]
 
-# Dell statement credit expiry (Amex-style half-year window; forfeited if
-# unspent). Override with SLICKDEALS_DELL_CREDIT_EXPIRY=YYYY-MM-DD.
-DELL_CREDIT_EXPIRY = os.environ.get("SLICKDEALS_DELL_CREDIT_EXPIRY", "2026-12-31")
+# Current credit was spent; resume next half-year, then roll periods forward.
+DELL_CREDIT_RESUME = os.environ.get("SLICKDEALS_DELL_CREDIT_RESUME", "2027-01-01")
+DELL_CREDIT_EXPIRY = os.environ.get("SLICKDEALS_DELL_CREDIT_EXPIRY")
 
 # Frontpage title searches for the storage tracker; classify_storage() filters.
 STORAGE_QUERIES = [
@@ -264,15 +264,26 @@ def collect(queries, mode, now, max_age_hours, dell_only=False, storage=False):
     return found
 
 
-def credit_note() -> str:
-    """Trailing header note counting down to the credit expiry."""
+def dell_credit_expiry(today: dt.date):
+    """Return the active half-year expiry, or None while paused/expired."""
     try:
-        expiry = dt.date.fromisoformat(DELL_CREDIT_EXPIRY)
+        if today < dt.date.fromisoformat(DELL_CREDIT_RESUME):
+            return None
+        expiry = (dt.date.fromisoformat(DELL_CREDIT_EXPIRY) if DELL_CREDIT_EXPIRY
+                  else dt.date(today.year, 6, 30) if today.month <= 6
+                  else dt.date(today.year, 12, 31))
     except ValueError:
+        return None
+    return expiry if today <= expiry else None
+
+
+def credit_note(today=None) -> str:
+    """Trailing header note only while the Dell credit tracker is active."""
+    today = today or dt.date.today()
+    expiry = dell_credit_expiry(today)
+    if expiry is None:
         return ""
-    days = (expiry - dt.date.today()).days
-    if days < 0:
-        return ""
+    days = (expiry - today).days
     marker = "🔴" if days <= 30 else ("🟠" if days <= 60 else "💳")
     return f"｜{marker} Dell credit 剩 {days} 天（{expiry:%m/%d} 到期）"
 
@@ -295,8 +306,10 @@ def main() -> int:
     args = parser.parse_args()
 
     now = dt.datetime.now(dt.timezone.utc)
+    today = now.astimezone().date()
     matches = collect(KEYWORDS, "frontpage", now, args.max_age_hours)
-    matches += collect(DELL_QUERIES, "", now, args.max_age_hours, dell_only=True)
+    if dell_credit_expiry(today) is not None:
+        matches += collect(DELL_QUERIES, "", now, args.max_age_hours, dell_only=True)
     matches += collect(STORAGE_QUERIES, "frontpage", now, args.max_age_hours, storage=True)
 
     seen = {} if args.no_state else load_state()
@@ -309,7 +322,7 @@ def main() -> int:
         picked.add(key)
         fresh.append(row)
 
-    print(f"Found {len(fresh)} candidate deals{credit_note()}")
+    print(f"Found {len(fresh)} candidate deals{credit_note(today)}")
     for age_hours, tag, title, link in fresh:
         age_text = "unknown age" if age_hours == 10**9 else f"{age_hours:.1f}h old"
         print(f"- [{tag}] {title} ({age_text})\n  {link}")
