@@ -42,8 +42,6 @@ for line in lines:
         items[-1] = items[-1] + "\n  " + line.strip()
 
 if not items:
-    count_part = header or "Found 0 candidate deals"
-    print(f"🛒 Slickdeals 監控\n{count_part}\n沒有符合條件的新 deal（72h 內）")
     sys.exit(0)
 
 parts = ["🛒 Slickdeals 監控", header, ""]
@@ -52,6 +50,12 @@ for item in items:
 print("\n".join(parts))
 PY
 )"
+
+if [[ -z "$msg" ]]; then
+  echo "$raw_output"
+  echo "No new deals; notification skipped."
+  exit 0
+fi
 
 if [[ "$DELIVER" == "true" ]]; then
   "$NOTIFY_DM" "$msg"

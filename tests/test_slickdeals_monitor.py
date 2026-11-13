@@ -15,6 +15,8 @@ SCRIPT = REPO / "notifiers" / "slickdeals_monitor.py"
 @pytest.fixture
 def mon(tmp_path, monkeypatch):
     monkeypatch.setenv("SLICKDEALS_STATE_PATH", str(tmp_path / "seen.json"))
+    monkeypatch.delenv("SLICKDEALS_DELL_CREDIT_RESUME", raising=False)
+    monkeypatch.delenv("SLICKDEALS_DELL_CREDIT_EXPIRY", raising=False)
     spec = importlib.util.spec_from_file_location("slickdeals_monitor_under_test", SCRIPT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -165,3 +167,35 @@ def test_existing_seen_state_suppresses_storage(mon, monkeypatch, capsys, tmp_pa
     _install_feeds(mon, monkeypatch, {"ssd": [(501, "SanDisk 8TB Desert Portable SSD")]})
     out = _run(mon, monkeypatch, capsys, argv=())
     assert out.startswith("Found 0 candidate deals")
+
+
+@pytest.mark.parametrize('day,expiry', [
+    ('2026-11-13', None), ('2026-12-31', None),
+    ('2027-01-01', '2027-06-30'), ('2027-06-30', '2027-06-30'),
+    ('2027-07-01', '2027-12-31'), ('2027-12-31', '2027-12-31'),
+    ('2028-01-01', '2028-06-30'),
+])
+def test_dell_pause_and_recurring_half_year_windows(mon, day, expiry):
+    today = dt.date.fromisoformat(day)
+    expected = dt.date.fromisoformat(expiry) if expiry else None
+    assert mon.dell_credit_expiry(today) == expected
+    note = mon.credit_note(today)
+    assert ('Dell' in note) == bool(expiry)
+    if expected:
+        assert f'{expected:%m/%d} 到期' in note
+
+
+def test_paused_dell_skips_search_and_header(mon, monkeypatch, capsys):
+    monkeypatch.setattr(mon, 'DELL_CREDIT_RESUME', '2999-01-01')
+    calls = _install_feeds(mon, monkeypatch, {})
+    out = _run(mon, monkeypatch, capsys)
+    assert not any(query in mon.DELL_QUERIES for query, mode in calls)
+    assert 'Dell' not in out
+
+
+def test_active_dell_search_resumes(mon, monkeypatch, capsys):
+    monkeypatch.setattr(mon, 'DELL_CREDIT_RESUME', '2020-01-01')
+    calls = _install_feeds(mon, monkeypatch, {})
+    _run(mon, monkeypatch, capsys)
+    assert [(query, mode) for query, mode in calls if query in mon.DELL_QUERIES] == [
+        (query, '') for query in mon.DELL_QUERIES]
