@@ -133,7 +133,7 @@ def test_unknown_timeout_does_not_repeat_incident_inside_cooldown(tmp_path, monk
     log.write_text("\n".join([SPAWN, START, ERROR]) + "\n")
     state_file = tmp_path / "state.json"
     args = argparse.Namespace(log_file=log, state_file=state_file, notify=True,
-                              notify_bin=shim, bootstrap_window_hours=100000,
+                              notify_bin=shim, heartbeat_dir=tmp_path / 'heartbeats', bootstrap_window_hours=100000,
                               pending_timeout_min=15, cooldown_hours=12, json=False)
     monkeypatch.setattr(notify_core, "route_send_budget", lambda route: 163)
     # The shim might have delivered one channel before timing out.
