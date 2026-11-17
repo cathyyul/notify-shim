@@ -14,6 +14,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "notifiers"))
 import claude_scheduler_watchdog as mod  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_heartbeat_workspace(tmp_path, monkeypatch):
+    monkeypatch.setattr(mod, 'WORKSPACE', tmp_path)
+
+
 # Real lines from ~/Library/Logs/Claude/main1.log, 2026-08-18/19 incident.
 STALE_LINES = [
     "2026-08-18 12:05:53 [info] LocalSessions.start:",
@@ -228,7 +233,7 @@ class TestEvaluate:
         mod.mark_recovered(state)
         assert state.get("active_incident") is None
 
-    def test_no_recovery_notice_if_never_alerted(self):
+    def test_undelivered_alert_keeps_ordered_recovery_obligation(self):
         state = {}
         # incident detected but nothing was ever delivered (no mark_alerted)
         mod.evaluate(state, mod.parse_events(STALE_LINES),
@@ -236,8 +241,8 @@ class TestEvaluate:
         assert state["active_incident"]["last_alert_at"] is None
         result = mod.evaluate(state, mod.parse_events([NORMAL_CONFIRM]),
                               now=T("2026-08-20 13:00:00"))
-        assert result.recovery_message is None
-        assert state.get("active_incident") is None
+        assert result.recovery_message is not None
+        assert [item['kind'] for item in state['notification_outbox']] == ['alert', 'recovery']
 
     def test_confirm_after_stale_in_same_window_means_recovered_not_alerting(self):
         state = {}
@@ -570,13 +575,13 @@ class TestRecoveryDeliveryGating:
         assert result.recovery_message is None
         assert state["active_incident"].get("resolved_by") is None
 
-    def test_incident_that_was_never_paged_still_closes_silently(self):
+    def test_incident_that_was_never_paged_keeps_pending_delivery(self):
         state = {}
         mod.evaluate(state, mod.parse_events(STALE_LINES), now=T("2026-08-18 13:00:00"))
         result = mod.evaluate(state, mod.parse_events([NORMAL_CONFIRM]),
                               now=T("2026-08-20 13:00:00"))
-        assert result.recovery_message is None
-        assert state.get("active_incident") is None
+        assert result.recovery_message is not None
+        assert state['active_incident']['resolved_by']
 
 
 class TestMainRecoveryGating:
@@ -1488,19 +1493,16 @@ class TestUsageLimit:
         assert result.alert_message is None
         assert state.get("active_incident") is None
 
-    def test_recovery_after_clean_confirm(self):
+    def test_clean_confirm_does_not_prove_quota_work_succeeded(self):
         state = {}
         mod.evaluate(state, mod.parse_events(self.SEQ), now=T("2026-09-05 23:10:00"))
         mod.mark_alerted(state, T("2026-09-05 23:10:00"))
-        # Next day: a clean confirm with no following api_error → recovered.
+        # Next day: a clean confirm proves start, not successful completion (#68).
         recover = "2026-09-06 23:03:50 [info] [CCDScheduledTasks] Confirmed task run for: daily-memory-sync"
         result = mod.evaluate(state, mod.parse_events([recover]),
                               now=T("2026-09-06 23:10:00"))
-        assert result.recovery_message is not None
-        assert result.incident_active is False
-        # the incident is held until a notifying run delivers the recovery notice
-        mod.mark_recovered(state)
-        assert state.get("active_incident") is None
+        assert result.recovery_message is None
+        assert result.incident_active is True
 
 
 class TestUsageLimitBinding:

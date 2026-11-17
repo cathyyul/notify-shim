@@ -274,7 +274,13 @@ hourly and alerts through `notify-dm` when it sees `session_stale_relogin` or a
 `Confirmed task run for: <X>` within 15 minutes. Alerts carry the cause, the fix
 (re-login to the Claude desktop app on the Mac mini), and the affected task
 list; same-cause alerts are deduped for 12h but a newly affected task re-alerts,
-and the first confirmed run after an alert sends a recovery notice.
+and the first confirmed run after a login/spawn alert sends a recovery notice.
+Quota incidents require successful completion, rather than a confirmed start:
+the watchdog reads the existing `data/ops/routine-heartbeat/<task>.json` contract,
+requiring matching task/schema/run identity, `status=ok`, and a run started after
+that task's latest quota failure. Missing, malformed, failed, future or older
+completion evidence retains the incident. `--heartbeat-dir` isolates fixtures;
+the heartbeat producer is unchanged.
 
 Not being able to look is itself an incident. If the log or the state file
 cannot be read, or a rotation leaves a gap the watchdog cannot prove it read
@@ -282,6 +288,11 @@ through, it alerts saying so rather than reporting healthy — a watchdog that i
 quietly blind is the failure this tool exists to catch. Alerts and recovery
 notices are only recorded as sent once `notify-dm` accepts them, so a failed
 send is retried on the next run instead of being silenced by the cooldown.
+Known undelivered notifications are persisted in an ordered outbox, even across
+check-only polls, restarts and recovery. A delayed historical alert is labelled
+as such, then its recovery is delivered in order. Timeout-unknown alert delivery
+keeps the existing cooldown suppression (one channel may already have sent).
+No tasks are restarted or replayed; routes and polling cadence are unchanged.
 
 ### Known limitations
 
