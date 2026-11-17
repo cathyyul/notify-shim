@@ -360,8 +360,8 @@ def format_alert(incident: "dict[str, Any]") -> str:
             "原因：Claude 額度用盡（session/usage limit）——排程 session 一起手就 "
             f"api_error 死掉、該 routine 這次沒跑{reset_txt}。")
         lines.append(
-            "修法：等額度重置後會自動恢復；incremental routine（如 daily-memory-sync）"
-            "下次成功執行會自動補齊積壓。若經常撞額度＝usage pacing 問題（錯開時段／減量）。")
+            "修法：等額度重置後，確認下一輪是否成功完成。若需補跑，先核對執行"
+            "紀錄中的已完成步驟，避免重複處理。")
     if CAUSE_UNCONFIRMED in causes:
         # Every active cause renders its own remedy. With `elif` here, an
         # incident that was both a login latch and a task timeout only ever
@@ -388,7 +388,7 @@ def format_recovery(incident: "dict[str, Any]", resolver: "dict[str, Any]") -> s
     elif resolver.get('kind') == 'completion':
         head = f"✅ Claude 排程工作已成功完成：{resolver.get('task')}（{when}）。"
     else:
-        head = ("✅ Claude 排程已恢復：偵測到 Confirmed task run for: "
+        head = ("✅ Claude 排程已恢復啟動：偵測到 Confirmed task run for: "
                 f"{resolver.get('task')}（{when}）。")
     lines = [head]
     tasks = incident.get("affected_tasks", [])
@@ -398,10 +398,9 @@ def format_recovery(incident: "dict[str, Any]", resolver: "dict[str, Any]") -> s
 
 
 def _evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetime,
-             pending_timeout_min: int = 15,
-             cooldown_hours: int = 12,
-             blocked_reason: Optional[str] = None,
-             completion_evidence: Optional[dict] = None) -> EvalResult:
+              pending_timeout_min: int = 15,
+              cooldown_hours: int = 12,
+              blocked_reason: Optional[str] = None) -> EvalResult:
     """Pure incident logic; mutates ``state`` in place.
 
     Deciding to alert is *not* recording that one was sent — the cooldown is
@@ -420,9 +419,7 @@ def _evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetim
     # dispatch in the same second came first, and the two orders mean opposite
     # things. Log order is the only ordering the log actually gives us.
     open_failures: "dict[str, Optional[dt.datetime]]" = {}
-    # Subset of open_failures that failed specifically on a usage/session limit —
-    # tracked apart so the alert can name the quota cause (and its reset hint)
-    # rather than the generic "spawn未Confirmed" (#30).
+    # Dispatch and quota failures have different resolution evidence.
     usage_limit_open: "dict[str, Optional[dt.datetime]]" = {}
     usage_reset_hint: Optional[str] = None
     stale_open = False
@@ -432,11 +429,15 @@ def _evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetim
             open_failures[task] = parse_ts(ts_str)
         for task, ts_str in (incident.get("usage_limit_open") or {}).items():
             usage_limit_open[task] = parse_ts(ts_str)
+            # Older state also stored quota failures in the dispatch map.
+            # Preserve any distinct dispatch failure, especially a newer one.
+            if not incident.get("separate_failures") and task in open_failures \
+                    and open_failures[task] == usage_limit_open[task]:
+                open_failures.pop(task)
         if (CAUSE_USAGE_LIMIT in incident.get('causes', []) and not usage_limit_open
                 and not incident.get('resolved_by')):
             # Legacy incidents without a quota timestamp cannot be proved recovered.
             usage_limit_open = {task: None for task in incident.get('affected_tasks', [])}
-        open_failures.update(usage_limit_open)
         usage_reset_hint = incident.get("usage_reset_hint")
         stale_open = bool(incident.get("stale_open"))
         stale_at = parse_ts(incident.get("stale_last_at"))
@@ -462,25 +463,19 @@ def _evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetim
         if ev.kind == "spawn":
             pending.append({"task": ev.task, "ts": fmt_ts(ev.ts)})
         elif ev.kind == "confirm":
-            # Task-level accounting (see the limitation noted in the README): a
-            # confirm says this task is running again, so it closes whatever was
-            # outstanding for it. A usage_limit that appears AFTER this confirm
-            # (the quota case is spawn→confirm→api_error) re-opens it below —
-            # confirm alone does not prove the run actually succeeded.
+            # A confirm proves a dispatch; the run may still fail on quota.
             pending = [p for p in pending if p["task"] != ev.task]
-            if ev.task not in usage_limit_open:
-                open_failures.pop(ev.task, None)
+            open_failures.pop(ev.task, None)
             if ev.ts is not None and (newest_confirm_at is None or ev.ts > newest_confirm_at):
                 newest_confirm_at = ev.ts
             last_confirm = ev
         elif ev.kind == "usage_limit":
             # The spawned session died on a session/usage limit — the routine did
             # not actually run, even though a Confirmed line was logged first.
-            note_failure(ev.task, ev.ts)
+            note_failure(None, ev.ts)
             if ev.task is not None:
                 previous = usage_limit_open.get(ev.task)
                 usage_limit_open[ev.task] = max(previous, ev.ts) if previous and ev.ts else ev.ts or previous
-                open_failures[ev.task] = usage_limit_open[ev.task]
             if ev.detail:
                 usage_reset_hint = ev.detail
         elif ev.kind == "cleared":
@@ -501,14 +496,6 @@ def _evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetim
             still_pending.append(p)
     state["pending_spawns"] = still_pending
 
-    last_completion = None
-    for task, failure in list(usage_limit_open.items()):
-        finished = successful_completion((completion_evidence or {}).get(task), task, failure, now)
-        if finished is not None:
-            usage_limit_open.pop(task)
-            open_failures.pop(task, None)
-            last_completion = dict(kind='completion', task=task, ts=fmt_ts(finished))
-
     if stale_seen:
         stale_open = True
     if window_stale_at is not None and (stale_at is None or window_stale_at > stale_at):
@@ -523,25 +510,23 @@ def _evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetim
         stale_open = False
         if stale_at is not None:
             open_failures = {task: ts for task, ts in open_failures.items()
-                             if task in usage_limit_open or (ts is not None and ts > stale_at)}
+                             if ts is not None and ts > stale_at}
 
     # Being unable to look is a cause, not a clean bill of health. It reflects
     # this run only: if we could read the log, we are no longer blind.
     blind_open = blocked_reason is not None
 
-    if not open_failures and not stale_open and not blind_open:
+    if not open_failures and not usage_limit_open and not stale_open and not blind_open:
         if incident is None:
             return EvalResult(None, None, incident_active=False)
         resolver = incident.get("resolved_by")
-        if last_completion is not None:
-            resolver = last_completion
-        elif last_confirm is not None and last_confirm.ts is not None:
+        if resolver is None and last_confirm is not None and last_confirm.ts is not None:
             resolver = {"kind": "confirm", "task": last_confirm.task,
                         "ts": fmt_ts(last_confirm.ts)}
         elif resolver is None and CAUSE_BLIND in incident.get("causes", []):
             # Sight returning is itself the evidence — no confirm required.
             resolver = {"kind": "observation", "ts": fmt_ts(now)}
-        pending_alert = any(item['kind'] == 'alert' and item['incident'] == incident.get('first_seen_at')
+        pending_alert = any(item['kind'] == 'alert' and item['incident'] == _incident_key(incident)
                             for item in state.get('notification_outbox', []))
         if (not incident.get("last_alert_at") and not pending_alert) or resolver is None:
             # Nothing was ever paged, so no notice is owed and the incident can
@@ -559,8 +544,11 @@ def _evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetim
         return EvalResult(None, format_recovery(incident, resolver),
                           incident_active=False)
 
-    if incident is None:
+    if incident is None or incident.get("resolved_by"):
+        # An already-resolved incident owns its historical outbox entries.
+        # Give a subsequent failure a fresh cooldown and delivery identity.
         incident = {
+            "notification_id": uuid.uuid4().hex,
             "first_seen_at": fmt_ts(window_first_failure) or fmt_ts(now),
             "causes": [],
             "affected_tasks": [],
@@ -572,25 +560,22 @@ def _evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetim
     causes = set()
     if stale_open:
         causes.add(CAUSE_STALE)
-    # A task down on a usage limit is classified as usage_limit, not the generic
-    # unconfirmed-spawn cause — only tasks that failed for some OTHER reason keep
-    # CAUSE_UNCONFIRMED, so a pure quota incident renders only the quota remedy.
     if usage_limit_open:
         causes.add(CAUSE_USAGE_LIMIT)
-    if set(open_failures) - set(usage_limit_open):
+    if open_failures:
         causes.add(CAUSE_UNCONFIRMED)
     if blind_open:
         causes.add(CAUSE_BLIND)
     incident["causes"] = sorted(causes)
     incident["blind_reason"] = blocked_reason
     incident["affected_tasks"] = sorted(
-        set(incident.get("affected_tasks", [])) | set(open_failures))
+        set(incident.get("affected_tasks", [])) | set(open_failures) | set(usage_limit_open))
+    incident["separate_failures"] = True
     incident["open_failures"] = {task: fmt_ts(ts) for task, ts in open_failures.items()}
     incident["usage_limit_open"] = {task: fmt_ts(ts) for task, ts in usage_limit_open.items()}
     incident["usage_reset_hint"] = usage_reset_hint
     incident["stale_open"] = stale_open
     incident["stale_last_at"] = fmt_ts(stale_at)
-    # Something is broken again, so any recovery notice still queued is void.
     incident["resolved_by"] = None
     prev_failure = parse_ts(incident.get("last_failure_at"))
     if window_last_failure is not None and (prev_failure is None
@@ -612,28 +597,86 @@ def _evaluate(state: "dict[str, Any]", events: "list[LogEvent]", now: dt.datetim
     return EvalResult(alert_message, None, incident_active=True)
 
 
+def _incident_key(incident):
+    return incident.get('notification_id') or incident.get('first_seen_at')
+
+
+def _is_notification_id(value):
+    return isinstance(value, str) and re.fullmatch(r'[a-f0-9]{32}', value) is not None
+
+
 def _enqueue(state, kind, message, incident):
     queue = state.setdefault('notification_outbox', [])
-    entry = dict(kind=kind, message=message, incident=incident.get('first_seen_at'),
+    entry = dict(kind=kind, message=message, incident=_incident_key(incident),
                  tasks=list(incident.get('affected_tasks', [])), causes=list(incident.get('causes', [])))
     if entry not in queue:
         queue.append(entry)
 
 
+def _reopen_unverified_quota_recovery(state, now):
+    incident = state.get('active_incident') or {}
+    resolver = incident.get('resolved_by') or {}
+    if (CAUSE_USAGE_LIMIT not in incident.get('causes', [])
+            or not resolver or resolver.get('kind') == 'completion'):
+        return
+
+    # Pre-completion states could have queued a quota recovery after a launch.
+    # Restore the most recent possible failure for each affected task.
+    failure = incident.get('last_failure_at') or resolver.get('ts') or fmt_ts(now)
+    affected = set(incident.get('affected_tasks', []))
+    if resolver.get('task'):
+        affected.add(resolver['task'])
+    incident['usage_limit_open'] = dict.fromkeys(sorted(affected), failure)
+    incident['resolved_by'] = None
+    key = _incident_key(incident)
+    state['notification_outbox'] = [
+        entry for entry in state.get('notification_outbox', [])
+        if entry['kind'] != 'recovery' or entry['incident'] != key
+    ]
+
+
 def evaluate(state, events, now, pending_timeout_min=15, cooldown_hours=12,
              blocked_reason=None, completion_evidence=None):
+    _reopen_unverified_quota_recovery(state, now)
     previous = copy.deepcopy(state.get('active_incident'))
     # Migrate a known, unacknowledged legacy alert before a confirm can clear it.
     if previous and previous.get('causes') and not previous.get('last_alert_at'):
         _enqueue(state, 'alert', format_alert(previous), previous)
-    result = _evaluate(state, events, now, pending_timeout_min, cooldown_hours,
-                       blocked_reason, completion_evidence)
+    result = _evaluate(state, events, now, pending_timeout_min, cooldown_hours, blocked_reason)
     incident = state.get('active_incident') or previous
     if result.alert_message:
         _enqueue(state, 'alert', result.alert_message, incident)
     if result.recovery_message:
         _enqueue(state, 'recovery', result.recovery_message, incident)
-    return result
+    if not (result.incident_active and completion_evidence and not blocked_reason):
+        return result
+
+    # Queue observed failures before applying successful heartbeats. This keeps
+    # both observations even when the failed and successful runs land in one poll.
+    completion = _apply_quota_completions(incident, completion_evidence, now)
+    if completion is None:
+        return result
+    recovery_message = format_recovery(incident, completion)
+    _enqueue(state, 'recovery', recovery_message, incident)
+    return EvalResult(result.alert_message, recovery_message, incident_active=False)
+
+
+def _apply_quota_completions(incident, evidence, now):
+    quota = incident['usage_limit_open']
+    completed = []
+    for task, stamp in list(quota.items()):
+        finished = successful_completion(evidence.get(task), task, parse_ts(stamp), now)
+        if finished is not None:
+            quota.pop(task)
+            completed.append((finished, task))
+    if not completed or quota:
+        return None
+    if incident['open_failures'] or incident['stale_open'] or incident['blind_reason']:
+        incident['causes'].remove(CAUSE_USAGE_LIMIT)
+        return None
+    finished, task = max(completed)
+    incident['resolved_by'] = dict(kind='completion', task=task, ts=fmt_ts(finished))
+    return incident['resolved_by']
 
 
 def successful_completion(document, task, failure, now):
@@ -669,8 +712,11 @@ def mark_alerted(state: "dict[str, Any]", now: dt.datetime) -> None:
     incident["last_alert_at"] = fmt_ts(now)
     incident["alerted_tasks"] = incident["affected_tasks"]
     incident["alerted_causes"] = incident["causes"]
-    state['notification_outbox'] = [item for item in state.get('notification_outbox', [])
-                                    if not (item['kind'] == 'alert' and item['message'] == format_alert(incident))]
+    state['notification_outbox'] = [
+        item for item in state.get('notification_outbox', [])
+        if not (item['kind'] == 'alert' and item['incident'] == _incident_key(incident)
+                and item['message'] == format_alert(incident))
+    ]
 
 
 def mark_recovered(state: "dict[str, Any]") -> None:
@@ -736,7 +782,7 @@ def _state_is_usable(state: Any) -> bool:
         for item in queue:
             if (not isinstance(item, dict) or set(item) != {'kind', 'message', 'incident', 'tasks', 'causes'}
                     or item['kind'] not in ('alert', 'recovery') or not isinstance(item['message'], str)
-                    or not optional_ts(item['incident'])
+                    or not (optional_ts(item['incident']) or _is_notification_id(item['incident']))
                     or not all(isinstance(item[k], list) and all(isinstance(v, str) for v in item[k])
                                for k in ('tasks', 'causes'))):
                 return False
@@ -778,6 +824,10 @@ def _state_is_usable(state: Any) -> bool:
     incident = state.get("active_incident")
     if "active_incident" in state and incident is not None:
         if not isinstance(incident, dict):
+            return False
+        if 'notification_id' in incident and not _is_notification_id(incident['notification_id']):
+            return False
+        if 'separate_failures' in incident and not isinstance(incident['separate_failures'], bool):
             return False
         for key in ("causes", "affected_tasks", "alerted_tasks", "alerted_causes"):
             if wrong(incident, key, list):
@@ -951,8 +1001,9 @@ def _run(args: argparse.Namespace, state_problem: Optional[str] = None,
                 break
             entry = queue[0]
             current = state.get('active_incident') or {}
+            current_key = _incident_key(current)
             delayed = entry['kind'] == 'alert' and (current.get('resolved_by')
-                        or current.get('first_seen_at') != entry['incident'])
+                        or current_key != entry['incident'])
             prefix = '（延後送達：以下為已觀察的歷史事故，非宣稱目前仍故障）\n' if delayed else ''
             if entry['kind'] == 'recovery' and result.incident_active:
                 prefix = '（延後送達：以下為先前恢復紀錄，非宣稱目前所有工作已恢復）\n'
@@ -962,12 +1013,12 @@ def _run(args: argparse.Namespace, state_problem: Optional[str] = None,
                 break
             queue.pop(0)
             if entry['kind'] == 'alert':
-                if current.get('first_seen_at') == entry['incident']:
+                if current_key == entry['incident']:
                     current['last_alert_at'] = fmt_ts(now)
                     for key, field in (('alerted_tasks', 'tasks'), ('alerted_causes', 'causes')):
                         current[key] = sorted(set(current.get(key, [])) | set(entry[field]))
                 alert_delivery_unknown |= delivered is None
-            elif current.get('first_seen_at') == entry['incident'] and current.get('resolved_by'):
+            elif current_key == entry['incident'] and current.get('resolved_by'):
                 mark_recovered(state)
             notified |= delivered is True
             try:
