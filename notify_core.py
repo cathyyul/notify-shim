@@ -474,7 +474,35 @@ def route_send_budget(route: str, *, routes_path: str | None = None,
 def send_one(channel: str, target: str, message: str, *, dry_run: bool,
              openclaw_bin: str | None = None,
              timeout: int = SEND_TIMEOUT_SECONDS, media: str | None = None):
-    """Send to one channel. Return ``(ok: bool, detail: str)`` — never raises.
+    """Send to one channel, preserving the public (ok, detail) result."""
+    outcome, detail = _send_one_outcome(channel, target, message, dry_run=dry_run,
+                                        openclaw_bin=openclaw_bin, timeout=timeout, media=media)
+    return dry_run or outcome == "sent", detail
+
+
+class _SendNotStarted(Exception):
+    """The OS rejected process creation before the CLI could send."""
+
+
+def _run_openclaw(cmd, *, env, timeout):
+    try:
+        child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, env=env)
+    except OSError as exc:
+        raise _SendNotStarted(str(exc)) from exc
+    with child:
+        try:
+            stdout, stderr = child.communicate(timeout=timeout)
+        except BaseException:
+            child.kill()
+            raise
+    return subprocess.CompletedProcess(cmd, child.returncode, stdout, stderr)
+
+
+def _send_one_outcome(channel: str, target: str, message: str, *, dry_run: bool,
+                      openclaw_bin: str | None = None, timeout: int = SEND_TIMEOUT_SECONDS,
+                      media: str | None = None):
+    """Send to one channel and return (delivery outcome, diagnostic detail).
 
     A bounded timeout plus catching every OSError (not just a missing binary)
     means one wedged/erroring channel becomes a normal per-channel failure
@@ -491,19 +519,20 @@ def send_one(channel: str, target: str, message: str, *, dry_run: bool,
     if dry_run:
         preview = list(cmd)
         preview[preview.index("--message") + 1] = "<message>"
-        return True, "dry-run (not sent): " + " ".join(preview)
+        return "not_sent", "dry-run (not sent): " + " ".join(preview)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              env=_env_with_binary_on_path(binary), timeout=timeout)
+        proc = _run_openclaw(cmd, env=_env_with_binary_on_path(binary), timeout=timeout)
+    except _SendNotStarted as exc:
+        return "not_sent", f"could not run openclaw ({exc})"
     except subprocess.TimeoutExpired:
-        return False, f"timed out after {timeout}s"
+        return "unknown", f"timed out after {timeout}s"
     except OSError as exc:
-        return False, f"could not run openclaw ({exc})"
-    return proc.returncode == 0, _command_detail(proc)
+        return "unknown", f"could not run openclaw ({exc})"
+    return ("sent" if proc.returncode == 0 else "unknown"), _command_detail(proc)
 
 
 def notify(route: str, message: str, *, routes_path: str | None = None,
-           dry_run: bool = False, notes=None, media: str | None = None):
+           dry_run: bool = False, notes=None, media: str | None = None, channel_results=None):
     """Fan ``message`` out to every channel of ``route``.
 
     Returns a list of ``(channel, target, ok, detail)`` tuples.
@@ -539,8 +568,11 @@ def notify(route: str, message: str, *, routes_path: str | None = None,
         kwargs = {"dry_run": dry_run}
         if media is not None:
             kwargs["media"] = media
-        ok, detail = send_one(ch["channel"], ch["target"], message, **kwargs)
+        outcome, detail = _send_one_outcome(ch["channel"], ch["target"], message, **kwargs)
+        ok = dry_run or outcome == "sent"
         results.append((ch["channel"], ch["target"], ok, detail))
+        if channel_results is not None:
+            channel_results.append({"channel": ch["channel"], "outcome": outcome})
     _record_ledger(route, results, dry_run=dry_run, notes=notes)
     return results
 
@@ -583,7 +615,7 @@ def _emit_json(obj, exit_code: int) -> int:
 
 
 def _emit_result(attempt_id, route: str, status: str, *, delivered=(),
-                 failed=(), reason=None) -> int:
+                 failed=(), channel_results=(), reason=None) -> int:
     return _emit_json({
         "contract": RESULT_CONTRACT,
         "version": RESULT_CONTRACT_VERSION,
@@ -592,6 +624,7 @@ def _emit_result(attempt_id, route: str, status: str, *, delivered=(),
         "status": status,
         "delivered_channels": list(delivered),
         "failed_channels": list(failed),
+        "channel_results": list(channel_results),
         "reason": reason,
     }, RESULT_EXIT[status])
 
@@ -625,19 +658,21 @@ def _main_result_json(args) -> int:
         print("notify: empty message", file=sys.stderr)
         return _emit_result(attempt_id, args.route, "error", reason="empty message")
     notes: list[str] = []
+    channel_results = []
     try:
         results = notify(args.route, message, routes_path=args.routes,
-                         dry_run=args.dry_run, notes=notes, media=args.media)
+                         dry_run=args.dry_run, notes=notes, media=args.media,
+                         channel_results=channel_results)
     except (FileNotFoundError, KeyError, ValueError) as exc:
         print(f"notify: {exc}", file=sys.stderr)
         return _emit_result(attempt_id, args.route, "error",
-                            reason=f"config error: {exc}")
+                            channel_results=channel_results, reason=f"config error: {exc}")
     except Exception as exc:
         # A send may already have gone out; the caller still must not count
         # this attempt as delivered (at-least-once, never false success).
         print(f"notify: unexpected {type(exc).__name__}: {exc}", file=sys.stderr)
         return _emit_result(attempt_id, args.route, "error",
-                            reason=f"unexpected {type(exc).__name__}")
+                            channel_results=channel_results, reason=f"unexpected {type(exc).__name__}")
     if not results:
         print(f"notify: route '{args.route}' has no enabled channels — "
               f"nothing sent", file=sys.stderr)
@@ -653,12 +688,12 @@ def _main_result_json(args) -> int:
               file=sys.stderr)
     if args.dry_run:
         return _emit_result(attempt_id, args.route, "dry_run",
-                            reason="dry run: nothing sent")
+                            channel_results=channel_results, reason="dry run: nothing sent")
     if delivered:
         return _emit_result(attempt_id, args.route, "delivered",
-                            delivered=delivered, failed=failed)
+                            delivered=delivered, failed=failed, channel_results=channel_results)
     return _emit_result(attempt_id, args.route, "failed", failed=failed,
-                        reason="every enabled channel failed")
+                        channel_results=channel_results, reason="every enabled channel failed")
 
 
 def main(argv=None) -> int:

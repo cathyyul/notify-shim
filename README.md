@@ -78,7 +78,9 @@ notify-dm --contract-version
 notify-dm --result-json --attempt-id thu-2026-10-02-r1 "message"
 # {"contract": "notify-shim.result", "version": 1, "attempt_id": "thu-2026-10-02-r1",
 #  "route": "dm", "status": "delivered", "delivered_channels": ["telegram", "line"],
-#  "failed_channels": [], "reason": null}
+#  "failed_channels": [], "channel_results": [{"channel": "telegram", "outcome": "sent"},
+#                                             {"channel": "line", "outcome": "sent"}],
+#  "reason": null}
 ```
 
 - **Probe first.** `--contract-version` reads no config, sends nothing and
@@ -103,6 +105,14 @@ notify-dm --result-json --attempt-id thu-2026-10-02-r1 "message"
   command output stay out of the JSON.
 - **Ledger-independent.** The status comes from this run's channel results;
   a failed send-ledger append does not change it.
+- **Per-channel delivery.** `channel_results` lists enabled route entries in order.
+  Each entry includes the channel name and its `outcome`. `sent` means the CLI
+  confirmed acceptance. `not_sent` means the send could not start or was a dry run.
+  A timeout, an ambiguous I/O failure, or a nonzero CLI exit yields `unknown`
+  because the service may already have accepted the message. Disabled entries
+  are omitted. An interrupted fan-out can report only a prefix with status `error`.
+  A retry that requires proof of total non-delivery needs status `failed` and
+  a complete, nonempty list of `not_sent` outcomes. Older v1 receipts lack this field.
 - **What `delivered` does not mean.** It is route-level API acceptance, not
   proof the message was displayed or read. If the shim crashes or its output
   is lost after a send, the caller sees no result and may retry, so delivery
