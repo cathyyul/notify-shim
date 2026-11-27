@@ -1,6 +1,6 @@
 """Unit tests for notify_core — route resolution + fail-loud fan-out.
 
-No network / no openclaw binary: subprocess.run is monkeypatched.
+Send tests use a fake OpenClaw command or an isolated local executable.
 """
 import json
 import os
@@ -95,7 +95,7 @@ def make_run(fail_targets=()):
 
 def test_notify_fans_out_to_all_channels(monkeypatch, routes_file):
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     results = notify_core.notify("dm", "hello", routes_path=routes_file)
@@ -113,7 +113,7 @@ def test_partial_failure_exits_zero(monkeypatch, routes_file):
     # notify-shim#26: LINE fails but Telegram delivers → message reached the
     # user, so the whole flow must NOT fail.
     run = make_run(fail_targets={"Uabc"})  # LINE fails, Telegram ok
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     rc = notify_core.main(["--route", "dm", "-m", "hi", "--routes", routes_file])
@@ -123,7 +123,7 @@ def test_partial_failure_exits_zero(monkeypatch, routes_file):
 def test_total_failure_exits_one(monkeypatch, routes_file):
     # Every channel failed → genuine outage → non-zero.
     run = make_run(fail_targets={"111", "Uabc"})
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     rc = notify_core.main(["--route", "dm", "-m", "hi", "--routes", routes_file])
@@ -132,7 +132,7 @@ def test_total_failure_exits_one(monkeypatch, routes_file):
 
 def test_partial_failure_sends_throttled_alert(monkeypatch, routes_file, alert_config):
     run = make_run(fail_targets={"Uabc"})  # LINE fails
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     rc = notify_core.main(["--route", "dm", "-m", "hi", "--routes", routes_file])
@@ -153,7 +153,7 @@ def test_alert_body_ends_with_static_fix_guide(monkeypatch, routes_file, alert_c
     # reaching the gateway. It is now a static lookup list the reader matches
     # against the detail above — no classification of the detail.
     run = make_run(fail_targets={"Uabc"})
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     assert notify_core.main(["--route", "dm", "-m", "hi", "--routes", routes_file]) == 0
@@ -182,7 +182,7 @@ def test_alert_body_strips_ansi_and_control_chars(monkeypatch, routes_file, aler
                                       "╭ Doctor notices ──╮")
         return FakeProc(0, stdout="✅ sent")
 
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     rc = notify_core.main(["--route", "dm", "-m", "hi", "--routes", routes_file])
@@ -201,7 +201,7 @@ def test_no_alert_config_still_exits_and_does_not_crash(monkeypatch, routes_file
     # Default fixture points alert config at a non-existent file → no email,
     # but delivery + exit-code behavior is unaffected.
     run = make_run(fail_targets={"Uabc"})
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     rc = notify_core.main(["--route", "dm", "-m", "hi", "--routes", routes_file])
@@ -210,7 +210,7 @@ def test_no_alert_config_still_exits_and_does_not_crash(monkeypatch, routes_file
 
 def test_all_ok_exits_zero(monkeypatch, routes_file):
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     rc = notify_core.main(["--route", "group-couple", "-m", "yo", "--routes", routes_file])
@@ -222,7 +222,7 @@ def test_dry_run_does_not_invoke_openclaw(monkeypatch, routes_file):
     def boom(*a, **k):  # pragma: no cover - must never be called
         raise AssertionError("subprocess.run called during dry-run")
 
-    monkeypatch.setattr(notify_core.subprocess, "run", boom)
+    monkeypatch.setattr(notify_core, "_run_openclaw", boom)
     results = notify_core.notify("dm", "hello", routes_path=routes_file, dry_run=True)
     assert all(ok for *_, ok, _ in results)
     assert all("dry-run" in detail for *_, detail in results)
@@ -252,7 +252,7 @@ def test_missing_routes_file_exits_2(monkeypatch, tmp_path):
 
 def test_positional_message_joined(monkeypatch, routes_file):
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
     rc = notify_core.main(["--route", "dm", "hello", "world", "--routes", routes_file])
     assert rc == 0
@@ -263,7 +263,7 @@ def test_send_one_prepends_binary_dir_to_path(monkeypatch):
     """openclaw (a Node CLI) needs its own dir on PATH to find node when run
     under a minimal launchd environment."""
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
     ok, _detail = notify_core.send_one(
@@ -280,7 +280,7 @@ def test_send_one_prepends_binary_dir_to_path(monkeypatch):
 
 def test_send_one_does_not_duplicate_existing_dir(monkeypatch):
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setenv("PATH", "/opt/homebrew/bin:/usr/bin")
 
     notify_core.send_one("line", "Uabc", "hi", dry_run=False,
@@ -294,7 +294,7 @@ def test_send_one_bare_binary_name_does_not_inject_cwd(monkeypatch):
     """A bare command name must NOT cause the caller's cwd to be prepended to
     PATH (os.path.abspath('openclaw') would resolve to $PWD/openclaw)."""
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
 
     notify_core.send_one("line", "Uabc", "hi", dry_run=False, openclaw_bin="openclaw")
@@ -305,7 +305,7 @@ def test_send_one_bare_binary_name_does_not_inject_cwd(monkeypatch):
 def test_send_one_timeout_returns_false(monkeypatch):
     def raise_timeout(*a, **k):
         raise notify_core.subprocess.TimeoutExpired(cmd="openclaw", timeout=1)
-    monkeypatch.setattr(notify_core.subprocess, "run", raise_timeout)
+    monkeypatch.setattr(notify_core, "_run_openclaw", raise_timeout)
     ok, detail = notify_core.send_one("line", "Uabc", "hi", dry_run=False,
                                       openclaw_bin="openclaw", timeout=1)
     assert not ok and "timed out" in detail
@@ -314,7 +314,7 @@ def test_send_one_timeout_returns_false(monkeypatch):
 def test_send_one_oserror_returns_false(monkeypatch):
     def raise_oserror(*a, **k):
         raise PermissionError("denied")
-    monkeypatch.setattr(notify_core.subprocess, "run", raise_oserror)
+    monkeypatch.setattr(notify_core, "_run_openclaw", raise_oserror)
     ok, detail = notify_core.send_one("line", "Uabc", "hi", dry_run=False,
                                       openclaw_bin="openclaw")
     assert not ok and "could not run" in detail
@@ -346,7 +346,7 @@ def toggle_routes(tmp_path):
 
 def test_disabled_channel_is_skipped(monkeypatch, toggle_routes):
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     results = notify_core.notify("mixed", "hi", routes_path=toggle_routes)
@@ -359,7 +359,7 @@ def test_disabled_channel_is_skipped(monkeypatch, toggle_routes):
 def test_all_disabled_route_sends_nothing_exits_zero(monkeypatch, toggle_routes):
     def boom(*a, **k):  # pragma: no cover
         raise AssertionError("must not send when all channels disabled")
-    monkeypatch.setattr(notify_core.subprocess, "run", boom)
+    monkeypatch.setattr(notify_core, "_run_openclaw", boom)
 
     rc = notify_core.main(["--route", "all-off", "-m", "hi", "--routes", toggle_routes])
     assert rc == 0
@@ -367,7 +367,7 @@ def test_all_disabled_route_sends_nothing_exits_zero(monkeypatch, toggle_routes)
 
 def test_explicit_enabled_true_sends(monkeypatch, toggle_routes):
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
     rc = notify_core.main(["--route", "explicit-on", "-m", "hi", "--routes", toggle_routes])
     assert rc == 0
@@ -378,7 +378,7 @@ def test_explicit_enabled_true_sends(monkeypatch, toggle_routes):
 
 def test_ledger_records_successful_send(monkeypatch, routes_file, tmp_path):
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     notify_core.notify("group-couple", "hi", routes_path=routes_file)
@@ -393,7 +393,7 @@ def test_ledger_records_successful_send(monkeypatch, routes_file, tmp_path):
 
 def test_ledger_records_ok_false_when_all_channels_fail(monkeypatch, routes_file):
     run = make_run(fail_targets={"-100999", "Cdef"})  # both group channels fail
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     notify_core.notify("group-couple", "hi", routes_path=routes_file)
@@ -407,7 +407,7 @@ def test_ledger_records_ok_false_when_all_channels_fail(monkeypatch, routes_file
 def test_ledger_skipped_on_dry_run(monkeypatch, routes_file):
     def boom(*a, **k):  # pragma: no cover
         raise AssertionError("subprocess.run called during dry-run")
-    monkeypatch.setattr(notify_core.subprocess, "run", boom)
+    monkeypatch.setattr(notify_core, "_run_openclaw", boom)
 
     notify_core.notify("dm", "hi", routes_path=routes_file, dry_run=True)
 
@@ -417,7 +417,7 @@ def test_ledger_skipped_on_dry_run(monkeypatch, routes_file):
 def test_ledger_failure_never_breaks_delivery_but_logs(monkeypatch, routes_file,
                                                         tmp_path, capsys):
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
     # Ledger parent is a *file*, so mkdir/open must fail — delivery must survive.
     blocker = tmp_path / "blocker"
@@ -434,7 +434,7 @@ def test_ledger_records_per_channel_outcome(monkeypatch, routes_file):
     """A nudge that points to one channel must be able to gate on that channel,
     so the ledger records per-channel success, not just any_ok."""
     run = make_run(fail_targets={"Cdef"})  # group-couple: LINE fails, Telegram ok
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     notify_core.notify("group-couple", "hi", routes_path=routes_file)
@@ -453,7 +453,7 @@ def test_ledger_written_even_when_a_later_channel_raises(monkeypatch, routes_fil
         if target == "Cdef":  # LINE (second channel) raises
             raise PermissionError("boom")
         return FakeProc(0, stdout="ok")
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     notify_core.notify("group-couple", "hi", routes_path=routes_file)
@@ -467,7 +467,7 @@ def test_ledger_ts_has_microsecond_precision(monkeypatch, routes_file):
     distinct, ordered timestamps for the strict watermark filter downstream."""
     import re
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     notify_core.notify("dm", "hi", routes_path=routes_file)
@@ -511,7 +511,7 @@ def _run_with_banner(fail_target):
 
 def test_alert_detail_survives_banner_and_names_exit_code(
         monkeypatch, routes_file, alert_config):
-    monkeypatch.setattr(notify_core.subprocess, "run", _run_with_banner("Uabc"))
+    monkeypatch.setattr(notify_core, "_run_openclaw", _run_with_banner("Uabc"))
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     assert notify_core.main(["--route", "dm", "-m", "hi",
@@ -533,7 +533,7 @@ def test_banner_only_output_still_reports_exit_code(monkeypatch, routes_file,
             return FakeProc(3, stdout=BANNER)
         return FakeProc(0, stdout="✅ sent")
 
-    monkeypatch.setattr(notify_core.subprocess, "run", _run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", _run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     assert notify_core.main(["--route", "dm", "-m", "hi",
@@ -544,7 +544,7 @@ def test_banner_only_output_still_reports_exit_code(monkeypatch, routes_file,
 def test_alert_names_host_pid_and_caller(monkeypatch, routes_file, alert_config):
     monkeypatch.setenv("NOTIFY_CALLER", "com.openclaw.channel-watchdog")
     run = make_run(fail_targets={"Uabc"})
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     assert notify_core.main(["--route", "dm", "-m", "hi",
@@ -563,7 +563,7 @@ def test_ledger_failure_reaches_the_alert_body(monkeypatch, routes_file,
     blocker.write_text("x", encoding="utf-8")
     monkeypatch.setenv("NOTIFY_LEDGER", str(blocker / "ledger.jsonl"))
     run = make_run(fail_targets={"Uabc"})
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     assert notify_core.main(["--route", "dm", "-m", "hi",
@@ -582,7 +582,7 @@ def test_unwritable_throttle_state_warns_about_repeats(monkeypatch, routes_file,
     readonly.chmod(0o500)
     try:
         run = make_run(fail_targets={"Uabc"})
-        monkeypatch.setattr(notify_core.subprocess, "run", run)
+        monkeypatch.setattr(notify_core, "_run_openclaw", run)
         monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
         assert notify_core.main(["--route", "dm", "-m", "hi",
@@ -691,7 +691,7 @@ def test_media_cli_fans_out_to_every_enabled_channel(monkeypatch, result_routes,
     image = tmp_path / "test image.jpg"
     image.write_bytes(b"synthetic fixture")
     run = make_run(fail_targets={"Uabc"})
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     rc, result = _result_main(capsys, ["--route", "dm", "-m", "caption", "--routes",
                                       result_routes, "--media", str(image)])
     assert rc == 0 and result["status"] == "delivered"
@@ -707,7 +707,7 @@ def test_media_cli_fans_out_to_every_enabled_channel(monkeypatch, result_routes,
 def test_invalid_media_is_error_before_any_send(monkeypatch, result_routes, capsys,
                                                tmp_path, filename):
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     rc, result = _result_main(capsys, ["--route", "dm", "-m", "caption", "--routes",
                                       result_routes, "--media", str(tmp_path / filename)])
     assert rc == 2 and result["status"] == "error"
@@ -722,7 +722,7 @@ def test_media_disabled_and_dry_run_never_send(monkeypatch, result_routes, capsy
                                               tmp_path, route, dry_run, status, rc):
     image = tmp_path / "test.jpg"
     image.write_bytes(b"synthetic fixture")
-    monkeypatch.setattr(notify_core.subprocess, "run",
+    monkeypatch.setattr(notify_core, "_run_openclaw",
                         lambda *a, **k: pytest.fail("must not send"))
     args = ["--route", route, "-m", "caption", "--routes", result_routes,
             "--media", str(image)]
@@ -737,7 +737,7 @@ def test_default_mode_forwards_media(monkeypatch, result_routes, tmp_path):
     image = tmp_path / "test.jpg"
     image.write_bytes(b"synthetic fixture")
     run = make_run()
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     assert notify_core.main(["--route", "solo", "-m", "caption", "--routes",
                              result_routes, "--media", str(image)]) == 0
     assert run.calls[0][run.calls[0].index("--media") + 1] == str(image)
@@ -751,19 +751,23 @@ def test_default_mode_forwards_media(monkeypatch, result_routes, tmp_path):
 ])
 def test_result_json_reports_channel_outcomes(monkeypatch, result_routes, capsys,
                                               route, fail, status, delivered, failed):
-    monkeypatch.setattr(notify_core.subprocess, "run", make_run(fail_targets=fail))
+    monkeypatch.setattr(notify_core, "_run_openclaw", make_run(fail_targets=fail))
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
     rc, result = _result_main(capsys, ["--route", route, "-m", "hi", "--routes", result_routes])
     assert result["status"] == status
     assert result["attempt_id"] == "att-1" and result["route"] == route
     assert result["delivered_channels"] == delivered
     assert result["failed_channels"] == failed
+    assert result["channel_results"] == [
+        {"channel": ch["channel"], "outcome": "unknown" if ch["target"] in fail else "sent"}
+        for ch in RESULT_ROUTES[route]["channels"]
+    ]
     assert (rc == 0) is (status == "delivered")
 
 
 def test_result_json_partial_failure_still_alerts(monkeypatch, result_routes, capsys,
                                                   alert_config):
-    monkeypatch.setattr(notify_core.subprocess, "run", make_run(fail_targets={"Uabc"}))
+    monkeypatch.setattr(notify_core, "_run_openclaw", make_run(fail_targets={"Uabc"}))
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
     rc, result = _result_main(capsys, ["--route", "dm", "-m", "hi", "--routes", result_routes])
     assert (rc, result["status"]) == (0, "delivered")
@@ -771,7 +775,7 @@ def test_result_json_partial_failure_still_alerts(monkeypatch, result_routes, ca
 
 
 def test_result_json_all_disabled_is_nonzero(monkeypatch, result_routes, capsys):
-    monkeypatch.setattr(notify_core.subprocess, "run",
+    monkeypatch.setattr(notify_core, "_run_openclaw",
                         lambda *a, **k: pytest.fail("must not send"))
     rc, result = _result_main(capsys, ["--route", "all-off", "-m", "hi", "--routes", result_routes])
     assert result["status"] == "disabled" and rc != 0
@@ -779,25 +783,26 @@ def test_result_json_all_disabled_is_nonzero(monkeypatch, result_routes, capsys)
 
 
 def test_default_mode_all_disabled_still_exits_zero(monkeypatch, result_routes, capsys):
-    monkeypatch.setattr(notify_core.subprocess, "run",
+    monkeypatch.setattr(notify_core, "_run_openclaw",
                         lambda *a, **k: pytest.fail("must not send"))
     assert notify_core.main(["--route", "all-off", "-m", "hi", "--routes", result_routes]) == 0
     assert capsys.readouterr().out == ""  # default mode prints nothing on stdout
 
 
 def test_result_json_dry_run_never_reports_delivered(monkeypatch, result_routes, capsys):
-    monkeypatch.setattr(notify_core.subprocess, "run",
+    monkeypatch.setattr(notify_core, "_run_openclaw",
                         lambda *a, **k: pytest.fail("dry-run must not send"))
     rc, result = _result_main(capsys, ["--route", "dm", "-m", "hi", "--routes",
                                        result_routes, "--dry-run"])
     assert result["status"] == "dry_run" and rc != 0
     assert result["delivered_channels"] == []
+    assert [item["outcome"] for item in result["channel_results"]] == ["not_sent", "not_sent"]
     assert not Path(notify_core.ledger_path()).exists()
 
 
 def test_result_json_survives_ledger_write_failure(monkeypatch, result_routes, capsys,
                                                    tmp_path):
-    monkeypatch.setattr(notify_core.subprocess, "run", make_run())
+    monkeypatch.setattr(notify_core, "_run_openclaw", make_run())
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
     blocker = tmp_path / "blocker"
     blocker.write_text("x", encoding="utf-8")
@@ -809,10 +814,35 @@ def test_result_json_survives_ledger_write_failure(monkeypatch, result_routes, c
 def test_result_json_timeout_is_a_failed_channel(monkeypatch, result_routes, capsys):
     def run(cmd, **kwargs):
         raise notify_core.subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
-    monkeypatch.setattr(notify_core.subprocess, "run", run)
+    monkeypatch.setattr(notify_core, "_run_openclaw", run)
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
     rc, result = _result_main(capsys, ["--route", "solo", "-m", "hi", "--routes", result_routes])
     assert (rc, result["status"], result["failed_channels"]) == (1, "failed", ["telegram"])
+    assert result["channel_results"] == [{"channel": "telegram", "outcome": "unknown"}]
+
+
+@pytest.mark.parametrize("accepts,expected", [(False, "not_sent"), (True, "unknown")])
+def test_result_json_proves_launch_failure_but_not_timeout(
+        monkeypatch, result_routes, capsys, tmp_path, accepts, expected):
+    binary = tmp_path / "fake-openclaw"
+    marker = tmp_path / "accepted"
+    if accepts:
+        binary.write_text('#!/bin/sh\nprintf accepted > "$ACCEPT_MARKER"\nexec /bin/sleep 30\n')
+        binary.chmod(0o700)
+    monkeypatch.setenv("OPENCLAW_BIN", str(binary))
+    monkeypatch.setenv("ACCEPT_MARKER", str(marker))
+    real_run = notify_core._run_openclaw
+
+    def short_send(cmd, **kwargs):
+        assert cmd[0] == str(binary)
+        kwargs["timeout"] = 1
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(notify_core, "_run_openclaw", short_send)
+    rc, result = _result_main(capsys, ["--route", "solo", "-m", "fixture", "--routes", result_routes])
+    assert marker.exists() == accepts
+    assert (rc, result["status"], result["failed_channels"]) == (1, "failed", ["telegram"])
+    assert result["channel_results"] == [{"channel": "telegram", "outcome": expected}]
 
 
 @pytest.mark.parametrize("args,needle", [
@@ -822,7 +852,7 @@ def test_result_json_timeout_is_a_failed_channel(monkeypatch, result_routes, cap
 ])
 def test_result_json_config_errors_are_error_status(monkeypatch, result_routes, capsys,
                                                     args, needle):
-    monkeypatch.setattr(notify_core.subprocess, "run",
+    monkeypatch.setattr(notify_core, "_run_openclaw",
                         lambda *a, **k: pytest.fail("must not send"))
     rc, result = _result_main(capsys, args + ["--routes", result_routes])
     assert (rc, result["status"]) == (2, "error")
@@ -847,7 +877,7 @@ def test_result_json_unexpected_exception_is_error(monkeypatch, result_routes, c
 
 @pytest.mark.parametrize("attempt", [None, "", "has space", "x" * 129, "-leading"])
 def test_result_json_requires_a_valid_attempt_id(monkeypatch, result_routes, capsys, attempt):
-    monkeypatch.setattr(notify_core.subprocess, "run",
+    monkeypatch.setattr(notify_core, "_run_openclaw",
                         lambda *a, **k: pytest.fail("must not send"))
     rc, result = _result_main(capsys, ["--route", "dm", "-m", "hi", "--routes", result_routes],
                               attempt=attempt)
@@ -863,7 +893,7 @@ def test_attempt_id_without_result_json_is_a_usage_error(result_routes, capsys):
 
 
 def test_unwritable_result_is_never_delivered(monkeypatch, result_routes, capsys):
-    monkeypatch.setattr(notify_core.subprocess, "run", make_run())
+    monkeypatch.setattr(notify_core, "_run_openclaw", make_run())
     monkeypatch.setattr(notify_core, "find_openclaw", lambda: "openclaw")
 
     class BrokenStdout:
@@ -881,7 +911,7 @@ def test_unwritable_result_is_never_delivered(monkeypatch, result_routes, capsys
 
 
 def test_contract_version_is_read_only(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(notify_core.subprocess, "run",
+    monkeypatch.setattr(notify_core, "_run_openclaw",
                         lambda *a, **k: pytest.fail("probe must not send"))
     monkeypatch.setattr(notify_core, "load_routes",
                         lambda *a, **k: pytest.fail("probe must not read routes"))
